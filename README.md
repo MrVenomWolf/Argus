@@ -114,7 +114,6 @@ python test_suite.py
 ├── main.py                          <- CLI entry point with batched scanning & signal prioritization
 ├── gui.py                           <- Non-blocking dark Tkinter + Matplotlib quantitative terminal
 ├── test_suite.py                    <- 11 unit & integration tests verifying math, edge cases, and pipeline
-├── MATH_AND_CHANGES_EXPLAINED.txt   <- Deep-dive mathematical documentation & technical interview Q&A guide
 ├── docs/
 │   ├── dashboard.png                <- v2 Quantitative Desktop Terminal preview
 │   ├── methodology_diagram.svg      <- 5-stage statistical & price-structure pipeline diagram
