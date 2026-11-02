@@ -76,7 +76,7 @@ class DashboardApp(tk.Tk):
         self.donchian_var = tk.StringVar(value=str(config.DONCHIAN_WINDOW))
 
         for label, var, values, width in (
-            ("Universe:", self.universe_var, ["ALL_NSE", "NIFTY_500", "NIFTY_200"], 11),
+            ("Universe:", self.universe_var, ["ALL_NSE", "NIFTY_500", "NIFTY_200", "SPX_500"], 11),
             ("Timeframe:", self.interval_var, ["15m", "1h", "1d"], 6),
             ("Min RVOL (x):", self.rvol_var, None, 5),
             ("Min Z (\u03c3):", self.z_var, None, 5),
@@ -252,19 +252,20 @@ class DashboardApp(tk.Tk):
         displayed = [a for a in self.all_last_anomalies if not only_bo or a.is_actionable_breakout]
 
         for a in displayed:
+            cur = a.currency
             iid = self.tree.insert(
                 "",
                 tk.END,
                 values=(
                     a.point.symbol.replace(".NS", ""),
                     a.signal,
-                    f"\u20b9{a.close_price:,.2f}",
+                    f"{cur}{a.close_price:,.2f}",
                     f"{a.rvol:.2f}x",
                     f"{a.z_score:+.2f}\u03c3",
                     f"{a.modified_z_score:+.2f}\u03c3",
                     f"{a.close_location_value * 100:.0f}%",
-                    f"\u20b9{a.stop_loss:,.2f}",
-                    f"\u20b9{a.target_price:,.2f}",
+                    f"{cur}{a.stop_loss:,.2f}",
+                    f"{cur}{a.target_price:,.2f}",
                 ),
                 tags=(a.signal,),
             )
@@ -351,16 +352,22 @@ class DashboardApp(tk.Tk):
             if bt
             else "Backtest: Insufficient historical bars"
         )
+        cur = anomaly.currency
+        turnover_str = (
+            f"\u20b9{anomaly.turnover_cr:,.1f} Cr"
+            if cur == "\u20b9"
+            else f"${(anomaly.baseline_median * anomaly.close_price) / 1e6:,.1f}M"
+        )
         proj_note = " (Intraday Normalized)" if anomaly.is_live_projected else ""
         info_text = (
-            f"SYMBOL: {symbol:<13} | SIGNAL: {anomaly.signal:<16} | CLOSE: \u20b9{anomaly.close_price:,.2f} "
-            f"| MEDIAN TURNOVER: \u20b9{anomaly.turnover_cr:,.1f} Cr\n"
+            f"SYMBOL: {symbol:<13} | SIGNAL: {anomaly.signal:<16} | CLOSE: {cur}{anomaly.close_price:,.2f} "
+            f"| MEDIAN TURNOVER: {turnover_str}\n"
             f"VOLUME STATS -> RVOL: {anomaly.rvol:.2f}x{proj_note} | Parametric Log-Z: {anomaly.z_score:+.2f}\u03c3 "
             f"| Robust Log-MAD Z: {anomaly.modified_z_score:+.2f}\u03c3 | CLV: {anomaly.close_location_value*100:.0f}%\n"
-            f"DONCHIAN ({donchian_n}) -> Upper: \u20b9{anomaly.donchian_upper:,.2f} | Mid: \u20b9{anomaly.donchian_mid:,.2f} "
-            f"| Lower: \u20b9{anomaly.donchian_lower:,.2f} | Width: {anomaly.channel_width_pct:.1f}%\n"
-            f"WILDER ATR(14): \u20b9{anomaly.atr:,.2f} | INITIAL STOP (2xATR): \u20b9{anomaly.stop_loss:,.2f} "
-            f"| 2R TARGET (4xATR): \u20b9{anomaly.target_price:,.2f}\n{bt_line}"
+            f"DONCHIAN ({donchian_n}) -> Upper: {cur}{anomaly.donchian_upper:,.2f} | Mid: {cur}{anomaly.donchian_mid:,.2f} "
+            f"| Lower: {cur}{anomaly.donchian_lower:,.2f} | Width: {anomaly.channel_width_pct:.1f}%\n"
+            f"WILDER ATR(14): {cur}{anomaly.atr:,.2f} | INITIAL STOP (2xATR): {cur}{anomaly.stop_loss:,.2f} "
+            f"| 2R TARGET (4xATR): {cur}{anomaly.target_price:,.2f}\n{bt_line}"
         )
         sig_color = {
             "LONG BREAKOUT": "#00e676",

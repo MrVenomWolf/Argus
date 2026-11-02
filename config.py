@@ -1,9 +1,9 @@
 """
 config.py
 =========
-Central configuration and dynamic loader for ALL publicly listed NSE equities
-from the official NSE master database (`EQUITY_L.csv`), with local disk caching
-for instant startup.
+Central configuration and dynamic universe loader for ALL publicly listed NSE
+equities (`EQUITY_L.csv`), Nifty indices, and the S&P 500 (`SPX_500`), with
+local disk caching for instant startup.
 """
 
 from io import StringIO
@@ -36,13 +36,14 @@ UNIVERSE_URLS = {
     "ALL_NSE": "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
     "NIFTY_500": "https://archives.nseindia.com/content/indices/ind_nifty500list.csv",
     "NIFTY_200": "https://archives.nseindia.com/content/indices/ind_nifty200list.csv",
+    "SPX_500": "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
 }
 
 
 def get_nse_stocks(universe: str = "ALL_NSE", timeout: int = 10) -> List[str]:
     """
-    Fetch every publicly listed stock on NSE directly from the exchange
-    (no hardcoded stock fallbacks), with local disk caching for fast startup.
+    Fetch every ticker for `universe` ("ALL_NSE", "NIFTY_500", "NIFTY_200", "SPX_500")
+    directly from official exchange/index sources with local JSON caching.
     """
     key = universe.upper() if universe.upper() in UNIVERSE_URLS else "ALL_NSE"
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -63,7 +64,15 @@ def get_nse_stocks(universe: str = "ALL_NSE", timeout: int = 10) -> List[str]:
     df = pd.read_csv(StringIO(resp.text))
     df.columns = df.columns.str.strip()
     col = "Symbol" if "Symbol" in df.columns else "SYMBOL"
-    tickers = (df[col].dropna().astype(str).str.strip() + ".NS").tolist()
+    symbols = df[col].dropna().astype(str).str.strip()
+
+    if key == "SPX_500":
+        # Yahoo Finance uses '-' instead of '.' for US share classes (e.g., BRK-B, BF-B)
+        us_tickers = [s.replace(".", "-") for s in symbols if s]
+        tickers = ["^GSPC", "SPY"] + us_tickers
+    else:
+        tickers = [f"{s}.NS" for s in symbols if s]
+
     cache_file.write_text(json.dumps(tickers), encoding="utf-8")
     return tickers
 

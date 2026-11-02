@@ -50,6 +50,10 @@ class Anomaly:
     is_live_projected: bool = False
 
     @property
+    def currency(self) -> str:
+        return "\u20b9" if self.point.symbol.endswith(".NS") else "$"
+
+    @property
     def effective_z(self) -> float:
         return max(self.z_score, self.modified_z_score)
 
@@ -62,14 +66,15 @@ class Anomaly:
         return self.signal in ("LONG BREAKOUT", "SHORT BREAKDOWN")
 
     def __str__(self) -> str:
-        price_str = f"₹{self.close_price:,.2f}" if self.close_price > 0 else "N/A"
+        cur = self.currency
+        price_str = f"{cur}{self.close_price:,.2f}" if self.close_price > 0 else "N/A"
         proj_tag = " [LIVE-PROJ]" if self.is_live_projected else ""
         return (
             f"[{self.signal}] {self.point.symbol:<13} @ {price_str:<10} | "
             f"RVOL {self.rvol:5.2f}x | Log-Z {self.z_score:+5.2f}\u03c3 | "
             f"MAD-Z {self.modified_z_score:+5.2f}\u03c3 | CLV {self.close_location_value*100:4.0f}% | "
             f"Donchian [{self.donchian_lower:,.1f} - {self.donchian_upper:,.1f}] | "
-            f"Stop ₹{self.stop_loss:,.2f} / Target ₹{self.target_price:,.2f}{proj_tag}"
+            f"Stop {cur}{self.stop_loss:,.2f} / Target {cur}{self.target_price:,.2f}{proj_tag}"
         )
 
 
@@ -178,12 +183,13 @@ def _select_baseline_history(
             return np.array(same_slot[-window:], dtype=float), raw_vol, False
         return default_hist, raw_vol, False
 
-    now_ist = datetime.now(IST)
-    latest_date = (latest.timestamp.astimezone(IST) if latest.timestamp.tzinfo else latest.timestamp).date()
-    if latest_date == now_ist.date():
-        frac, is_open = nse_intraday_volume_fraction(now_ist)
-        if is_open and 0.08 <= frac < 0.98:
-            return default_hist, raw_vol / frac, True
+    if latest.symbol.endswith(".NS"):
+        now_ist = datetime.now(IST)
+        latest_date = (latest.timestamp.astimezone(IST) if latest.timestamp.tzinfo else latest.timestamp).date()
+        if latest_date == now_ist.date():
+            frac, is_open = nse_intraday_volume_fraction(now_ist)
+            if is_open and 0.08 <= frac < 0.98:
+                return default_hist, raw_vol / frac, True
 
     return default_hist, raw_vol, False
 

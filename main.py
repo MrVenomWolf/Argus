@@ -114,8 +114,8 @@ def main() -> None:
         "--universe",
         type=str,
         default="ALL_NSE",
-        choices=["ALL_NSE", "NIFTY_500", "NIFTY_200"],
-        help="NSE equity universe to scan (default: ALL_NSE)",
+        choices=["ALL_NSE", "NIFTY_500", "NIFTY_200", "SPX_500"],
+        help="Equity universe to scan: ALL_NSE, NIFTY_500, NIFTY_200, or SPX_500 (default: ALL_NSE)",
     )
     parser.add_argument(
         "--interval",
