@@ -1,0 +1,126 @@
+//@version=5
+strategy("NSE Log-Volume Anomaly + Donchian Breakout Strategy", shorttitle="NSE Vol-Donchian", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.075, slippage=2)
+
+// ============================================================================
+// 1. INPUT PARAMETERS
+// ============================================================================
+grp_vol = "1. Statistical Volume Anomaly Engine"
+volWindow     = input.int(20,     "Volume Baseline Lookback (W)", minval=5, group=grp_vol)
+minRvol       = input.float(2.0,  "Minimum RVOL (vs Median)", minval=1.0, step=0.1, group=grp_vol)
+minZScore     = input.float(2.5,  "Minimum Log Z-Score (sigma)", minval=1.0, step=0.1, group=grp_vol)
+useLogMad     = input.bool(true,  "Include Robust Log-MAD Z-Score (Anti-Masking)", group=grp_vol)
+
+grp_don = "2. Donchian Price Structure & Close Filter"
+donchianLen   = input.int(20,     "Donchian Channel Length (N)", minval=5, group=grp_don)
+minClv        = input.float(0.65, "Min Close Location Value (CLV 0..1)", minval=0.1, maxval=0.95, step=0.05, group=grp_don)
+allowShorts   = input.bool(false, "Enable Short Breakdown Trades (Intraday/F&O)", group=grp_don)
+
+grp_risk = "3. Wilder ATR Risk & Exit Management"
+atrLen        = input.int(14,     "Wilder ATR Period", minval=5, group=grp_risk)
+atrStopMult   = input.float(2.0,  "Initial Hard Stop (x ATR)", minval=0.5, step=0.25, group=grp_risk)
+atrTrailMult  = input.float(2.5,  "Chandelier Trailing Stop (x ATR)", minval=1.0, step=0.25, group=grp_risk)
+showHud       = input.bool(true,  "Show Live Quantitative HUD Table", group=grp_risk)
+
+// ============================================================================
+// 2. OUTLIER-RESISTANT VOLUME MATH (STRICTLY SHIFTED [1] TO EXCLUDE CURRENT BAR)
+// ============================================================================
+float logVol = math.log(1.0 + math.max(0.0, volume))
+
+float baselineMedianVol = ta.median(volume[1], volWindow)
+float rvol              = baselineMedianVol > 0 ? (volume / baselineMedianVol) : 1.0
+
+float logMean = ta.sma(logVol[1], volWindow)
+float logStd  = ta.stdev(logVol[1], volWindow)
+float logZ    = logStd > 1e-9 ? (logVol - logMean) / logStd : 0.0
+
+float logMed  = ta.median(logVol[1], volWindow)
+var float[] absDevArr = array.new_float(0)
+array.clear(absDevArr)
+for i = 1 to volWindow
+    array.push(absDevArr, math.abs(logVol[i] - logMed))
+float logMad      = array.median(absDevArr)
+float modifiedZ   = logMad > 1e-9 ? (0.67449 * (logVol - logMed)) / logMad : logZ
+
+float effectiveZ   = useLogMad ? math.max(logZ, modifiedZ) : logZ
+bool  isVolAnomaly = (rvol >= minRvol) and (effectiveZ >= minZScore)
+
+// ============================================================================
+// 3. SHIFTED DONCHIAN CHANNELS, CLV & WILDER ATR
+// ============================================================================
+float donUpper = ta.highest(high, donchianLen)[1]
+float donLower = ta.lowest(low, donchianLen)[1]
+float donMid   = 0.5 * (donUpper + donLower)
+
+float barRange = high - low
+float clv      = barRange > 1e-9 ? (close - low) / barRange : 0.5
+float atrVal   = ta.atr(atrLen)
+
+bool longBreakout   = isVolAnomaly and (close > donUpper) and (clv >= minClv) and (close >= open)
+bool shortBreakdown = isVolAnomaly and (close < donLower) and (clv <= (1.0 - minClv)) and (close <= open)
+
+// ============================================================================
+// 4. STRATEGY EXECUTION & DYNAMIC TRAILING STOP
+// ============================================================================
+var float activeStop   = na
+var float highestClose = na
+var float lowestClose  = na
+
+if strategy.position_size == 0
+    if longBreakout
+        activeStop   := close - (atrStopMult * atrVal)
+        highestClose := close
+        strategy.entry("Long Breakout", strategy.long, alert_message="VOL+DON LONG BREAKOUT")
+    else if allowShorts and shortBreakdown
+        activeStop   := close + (atrStopMult * atrVal)
+        lowestClose  := close
+        strategy.entry("Short Breakdown", strategy.short, alert_message="VOL+DON SHORT BREAKDOWN")
+else if strategy.position_size > 0
+    highestClose := math.max(nz(highestClose, close), close)
+    float chandelierStop = highestClose - (atrTrailMult * atrVal)
+    activeStop   := math.max(nz(activeStop, chandelierStop), math.max(donMid, chandelierStop))
+    strategy.exit("Long Trail Exit", from_entry="Long Breakout", stop=activeStop, alert_message="LONG TRAIL EXIT")
+else if strategy.position_size < 0
+    lowestClose  := math.min(nz(lowestClose, close), close)
+    float chandelierStop = lowestClose + (atrTrailMult * atrVal)
+    activeStop   := math.min(nz(activeStop, chandelierStop), math.min(donMid, chandelierStop))
+    strategy.exit("Short Trail Exit", from_entry="Short Breakdown", stop=activeStop, alert_message="SHORT TRAIL EXIT")
+
+// ============================================================================
+// 5. VISUAL PLOTS, SIGNALS & LIVE HUD
+// ============================================================================
+pUpper = plot(donUpper, "Donchian Upper (Prior N)", color=color.new(#00e676, 25), linewidth=2)
+pMid   = plot(donMid,   "Donchian Mid (Basis/Trail)", color=color.new(#ffab40, 35), linewidth=1, style=plot.style_circles)
+pLower = plot(donLower, "Donchian Lower (Prior N)", color=color.new(#ff5252, 25), linewidth=2)
+fill(pUpper, pLower, color=color.new(#007acc, 92), title="Donchian Channel Fill")
+
+plot(strategy.position_size != 0 ? activeStop : na, "Active Trailing Stop", color=color.new(#ff1744, 0), linewidth=2, style=plot.style_linebr)
+
+plotshape(longBreakout, title="Long Breakout", style=shape.triangleup, location=location.belowbar, color=#00e676, size=size.small, text="BO")
+plotshape(shortBreakdown, title="Short Breakdown", style=shape.triangledown, location=location.abovebar, color=#ff5252, size=size.small, text="BD")
+barcolor(longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c4ff : na)
+
+if showHud and barstate.islast
+    var table hud = table.new(position.top_right, 2, 7, bgcolor=color.new(#18181c, 10), border_color=#333338, border_width=1)
+    string sigText = longBreakout ? "LONG BREAKOUT" : shortBreakdown ? "SHORT BREAKDOWN" : isVolAnomaly ? "VOL ANOMALY" : "NORMAL"
+    color  sigCol  = longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c4ff : #aaaaaa
+
+    table.cell(hud, 0, 0, "SIGNAL STATE", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 0, sigText, text_color=sigCol, text_size=size.small)
+
+    table.cell(hud, 0, 1, "RVOL (vs Med)", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 1, str.tostring(rvol, "#.##") + "x", text_color=rvol >= minRvol ? #00e676 : #ffffff, text_size=size.small)
+
+    table.cell(hud, 0, 2, "Parametric Log-Z", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 2, str.tostring(logZ, "+#.##") + "s", text_color=logZ >= minZScore ? #00e676 : #ffffff, text_size=size.small)
+
+    table.cell(hud, 0, 3, "Robust Log-MAD Z", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 3, str.tostring(modifiedZ, "+#.##") + "s", text_color=modifiedZ >= minZScore ? #00e676 : #ffffff, text_size=size.small)
+
+    table.cell(hud, 0, 4, "Close Strength (CLV)", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 4, str.tostring(clv * 100, "#") + "%", text_color=clv >= minClv ? #00e676 : #ffffff, text_size=size.small)
+
+    table.cell(hud, 0, 5, "Donchian High / Low", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 5, str.tostring(donUpper, "#.##") + " / " + str.tostring(donLower, "#.##"), text_color=#ffffff, text_size=size.small)
+
+    table.cell(hud, 0, 6, "2xATR Stop / 2R Target", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 6, str.tostring(close - 2 * atrVal, "#.##") + " / " + str.tostring(close + 4 * atrVal, "#.##"), text_color=#ffab40, text_size=size.small)

@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.cache/
+.venv/
+venv/
+MATH_AND_CHANGES_EXPLAINED.txt
