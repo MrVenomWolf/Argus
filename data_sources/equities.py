@@ -133,14 +133,14 @@ def fetch_equities_batch(
                     time.sleep(1.0)
 
         if raw_df is not None and not raw_df.empty:
-            if len(chunk) == 1:
-                if pts := _df_to_datapoints(chunk[0], raw_df):
-                    results[chunk[0]] = pts
-            elif isinstance(raw_df.columns, pd.MultiIndex):
+            if isinstance(raw_df.columns, pd.MultiIndex):
                 available = set(raw_df.columns.get_level_values(0))
                 for t in chunk:
                     if t in available and (pts := _df_to_datapoints(t, raw_df[t])):
                         results[t] = pts
+            elif len(chunk) == 1:
+                if pts := _df_to_datapoints(chunk[0], raw_df):
+                    results[chunk[0]] = pts
 
         if progress_callback:
             progress_callback(min(total, start + len(chunk)), total)

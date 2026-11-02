@@ -345,10 +345,9 @@ class DashboardApp(tk.Tk):
         )
 
         bt_line = (
-            f"STRATEGY BACKTEST ({bt.total_bars} bars, 0.15% NSE cost) -> "
-            f"Vol+Donchian: {bt.trades} trades | WinRate: {bt.win_rate_pct:.1f}% | "
-            f"PF: {bt.profit_factor:.2f} | Avg R: {bt.avg_r_multiple:+.2f}R | "
-            f"Net: {bt.net_return_pct:+.1f}% (vs Raw Donchian: {bt.unfiltered_net_return_pct:+.1f}%)"
+            f"BACKTEST ({bt.total_bars} bars, 0.15% cost) -> Vol+Donchian: {bt.trades} trades | "
+            f"Win: {bt.win_rate_pct:.0f}% | PF: {bt.profit_factor:.2f} | Avg: {bt.avg_r_multiple:+.2f}R | "
+            f"Net: {bt.net_return_pct:+.1f}% (Raw Donchian: {bt.unfiltered_net_return_pct:+.1f}%)"
             if bt
             else "Backtest: Insufficient historical bars"
         )
