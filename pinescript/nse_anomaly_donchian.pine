@@ -1,5 +1,5 @@
 //@version=5
-strategy("NSE Log-Volume Anomaly + Donchian Breakout Strategy", shorttitle="NSE Vol-Donchian", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.125, slippage=2)
+strategy("NSE Log-Volume Anomaly + Donchian Breakout Strategy", shorttitle="NSE Vol-Donchian", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.125, slippage=2, calc_on_every_tick=true)
 
 // ============================================================================
 // 1. INPUT PARAMETERS
@@ -58,15 +58,20 @@ if timeframe.isintraday and useSameSlot
 
 bool hasSlotHist = array.size(slotVolArr) >= 5
 
-// Sample standard deviation uses `biased=false` (ddof=1) to match Python exactly
-float baselineMedianVol = hasSlotHist ? array.median(slotVolArr) : ta.median(rawVol[1], volWindow)
+// Evaluate rolling `ta.*` series unconditionally on every bar for Pine compiler consistency
+float rollMedVol  = ta.median(rawVol[1], volWindow)
+float rollLogMean = ta.sma(logVol[1], volWindow)
+float rollLogStd  = ta.stdev(logVol[1], volWindow, false)
+float rollLogMed  = ta.median(logVol[1], volWindow)
+
+float baselineMedianVol = hasSlotHist ? array.median(slotVolArr) : rollMedVol
 float rvol              = baselineMedianVol > 0 ? (rawVol / baselineMedianVol) : 1.0
 
-float logMean = hasSlotHist ? array.avg(slotLogArr) : ta.sma(logVol[1], volWindow)
-float logStd  = hasSlotHist ? array.stdev(slotLogArr, false) : ta.stdev(logVol[1], volWindow, false)
+float logMean = hasSlotHist ? array.avg(slotLogArr) : rollLogMean
+float logStd  = hasSlotHist ? array.stdev(slotLogArr, false) : rollLogStd
 float logZ    = logStd > 1e-9 ? (logVol - logMean) / logStd : 0.0
 
-float logMed  = hasSlotHist ? array.median(slotLogArr) : ta.median(logVol[1], volWindow)
+float logMed  = hasSlotHist ? array.median(slotLogArr) : rollLogMed
 if hasSlotHist
     for idx = 0 to array.size(slotLogArr) - 1
         array.push(absDevArr, math.abs(array.get(slotLogArr, idx) - logMed))
