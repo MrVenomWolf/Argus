@@ -140,11 +140,11 @@ pMid   = plot(donMid,   "Donchian Mid (Basis/Trail)", color=color.new(#ffab40, 3
 pLower = plot(donLower, "Donchian Lower (Prior N)", color=color.new(#ff5252, 25), linewidth=2)
 fill(pUpper, pLower, color=color.new(#007acc, 92), title="Donchian Channel Fill")
 
-plot(strategy.position_size != 0 ? activeStop : na, "Active Trailing Stop", color=color.new(#ff1744, 0), linewidth=2, style=plot.style_linebr)
-plot(strategy.position_size != 0 and useTakeProfit ? activeTarget : na, "Active Profit Target", color=color.new(#00e676, 0), linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 ? activeStop : na, "Active Trailing Stop", color=color.new(#ff1744, 0), linewidth=2, style=plot.style_linebr, display=display.pane)
+plot(strategy.position_size != 0 and useTakeProfit ? activeTarget : na, "Active Profit Target", color=color.new(#00e676, 0), linewidth=2, style=plot.style_linebr, display=display.pane)
 
-plotshape(longBreakout, title="Long Breakout", style=shape.triangleup, location=location.belowbar, color=#00e676, size=size.small, text="BO")
-plotshape(shortBreakdown, title="Short Breakdown", style=shape.triangledown, location=location.abovebar, color=#ff5252, size=size.small, text="BD")
+plotshape(longBreakout, title="Long Breakout", style=shape.triangleup, location=location.belowbar, color=#00e676, size=size.small, text="BO", display=display.pane)
+plotshape(shortBreakdown, title="Short Breakdown", style=shape.triangledown, location=location.abovebar, color=#ff5252, size=size.small, text="BD", display=display.pane)
 barcolor(longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c4ff : na)
 
 if showHud and barstate.islast
