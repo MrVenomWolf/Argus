@@ -9,13 +9,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import math
 from typing import List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 import config
 
-IST = timezone(timedelta(hours=5, minutes=30))
+IST = ZoneInfo("Asia/Kolkata")
+NY_TZ = ZoneInfo("America/New_York")
 NORMAL_CONSISTENCY_FACTOR = 0.6744897501960817  # Phi^-1(0.75)
 
 
@@ -48,6 +50,8 @@ class Anomaly:
     target_price: float = 0.0
     turnover_cr: float = 0.0
     is_live_projected: bool = False
+    p_value: float = 1.0
+    fdr_q: float = 1.0
 
     @property
     def currency(self) -> str:
@@ -55,7 +59,14 @@ class Anomaly:
 
     @property
     def effective_z(self) -> float:
-        return max(self.z_score, self.modified_z_score)
+        """
+        Uses Parametric Log-Z by default (higher efficiency on small N=20 samples),
+        and switches to Log-MAD Z only when historical variance is inflated by a
+        prior outlier in the window (preventing both variance masking and MAD noise inflation).
+        """
+        if self.modified_z_score > self.z_score * 1.40 and self.z_score > 0.5:
+            return self.modified_z_score
+        return self.z_score
 
     @property
     def delta_pct(self) -> str:
@@ -94,15 +105,41 @@ class BacktestResult:
 
 
 def nse_intraday_volume_fraction(now_ist: Optional[datetime] = None) -> Tuple[float, bool]:
-    """Expected cumulative fraction of daily NSE volume completed at `now_ist` (09:15-15:30 IST)."""
+    """
+    Parametric U-curve approximation of cumulative daily NSE volume (09:15-15:30 IST).
+    Requires at least 45 minutes elapsed (>= 10:00 IST, mins >= 600) before projecting
+    to avoid noisy early-morning multipliers.
+    """
     now_ist = (now_ist or datetime.now(IST)).astimezone(IST)
     mins = now_ist.hour * 60 + now_ist.minute
-    if now_ist.weekday() >= 5 or not (555 <= mins < 930):
+    if now_ist.weekday() >= 5 or not (600 <= mins < 930):
         return 1.0, False
 
-    t = max(5.0, float(mins - 555)) / 375.0
-    frac = max(0.08, min(1.0, t + 0.14 * math.sin(2.0 * math.pi * t)))
+    t = float(mins - 555) / 375.0
+    frac = max(0.20, min(1.0, t + 0.14 * math.sin(2.0 * math.pi * t)))
     return frac, True
+
+
+def student_t_one_sided_pvalue(t_stat: float, df: int = 19) -> float:
+    """Wallace (1959) Student-t to Normal tail conversion using standard-library `math.erfc`."""
+    if t_stat <= 0 or df < 2:
+        return 0.5
+    z_eq = math.sqrt(df * math.log1p((t_stat * t_stat) / df) * (1.0 - 0.5 / df))
+    return 0.5 * math.erfc(z_eq / math.sqrt(2.0))
+
+
+def apply_benjamini_hochberg(anomalies: List[Anomaly], total_tested: int) -> List[Anomaly]:
+    """Computes Benjamini-Hochberg (1995) False Discovery Rate q-values across `total_tested` symbols."""
+    if not anomalies:
+        return anomalies
+    m = max(total_tested, len(anomalies))
+    ordered = sorted(anomalies, key=lambda a: a.p_value)
+    running_min = 1.0
+    for rank in range(len(ordered), 0, -1):
+        a = ordered[rank - 1]
+        running_min = min(running_min, (a.p_value * m) / rank)
+        a.fdr_q = running_min
+    return anomalies
 
 
 def calculate_robust_metrics(history: np.ndarray, current: float) -> Tuple[float, float, float, float]:
@@ -158,9 +195,14 @@ def compute_donchian_channels(
         empty = np.array([], dtype=float)
         return empty, empty, empty
 
-    upper = pd.Series(highs, dtype=float).shift(1).rolling(window, min_periods=1).max().bfill().to_numpy()
-    lower = pd.Series(lows, dtype=float).shift(1).rolling(window, min_periods=1).min().bfill().to_numpy()
+    upper = pd.Series(highs, dtype=float).shift(1).rolling(window, min_periods=1).max().fillna(highs[0]).to_numpy()
+    lower = pd.Series(lows, dtype=float).shift(1).rolling(window, min_periods=1).min().fillna(lows[0]).to_numpy()
     return upper, lower, 0.5 * (upper + lower)
+
+
+def _to_exchange_hm(ts: datetime, tz: ZoneInfo) -> Tuple[int, int]:
+    t = ts.astimezone(tz) if ts.tzinfo else ts
+    return t.hour, t.minute
 
 
 def _select_baseline_history(
@@ -169,15 +211,14 @@ def _select_baseline_history(
     latest = points[-1]
     raw_vol = float(latest.value)
     default_hist = np.array([p.value for p in points[-(window + 1) : -1]], dtype=float)
+    tz = IST if latest.symbol.endswith(".NS") else NY_TZ
 
     if interval.endswith(("m", "h")):
-        t_ist = latest.timestamp.astimezone(IST) if latest.timestamp.tzinfo else latest.timestamp
-        slot = (t_ist.hour, t_ist.minute)
+        slot = _to_exchange_hm(latest.timestamp, tz)
         same_slot = [
             float(p.value)
             for p in points[:-1]
-            if ((p.timestamp.astimezone(IST) if p.timestamp.tzinfo else p.timestamp).hour, p.timestamp.minute) == slot
-            and p.value > 0
+            if _to_exchange_hm(p.timestamp, tz) == slot and p.value > 0
         ]
         if len(same_slot) >= 5:
             return np.array(same_slot[-window:], dtype=float), raw_vol, False
@@ -188,7 +229,7 @@ def _select_baseline_history(
         latest_date = (latest.timestamp.astimezone(IST) if latest.timestamp.tzinfo else latest.timestamp).date()
         if latest_date == now_ist.date():
             frac, is_open = nse_intraday_volume_fraction(now_ist)
-            if is_open and 0.08 <= frac < 0.98:
+            if is_open and 0.20 <= frac < 0.98:
                 return default_hist, raw_vol / frac, True
 
     return default_hist, raw_vol, False
@@ -242,8 +283,12 @@ def find_anomalies(
     hist_vols, eff_vol, is_proj = _select_baseline_history(points, window=window, interval=interval)
     baseline_med, rvol, z_score, modified_z = calculate_robust_metrics(hist_vols, eff_vol)
 
-    if max(z_score, modified_z) < min_z_score or rvol < min_rvol:
+    # Anti-masking gate: only promote modified_z when a prior spike inflated sample std relative to MAD
+    eff_z = modified_z if (modified_z > z_score * 1.40 and z_score > 0.5) else z_score
+    if eff_z < min_z_score or rvol < min_rvol:
         return []
+
+    p_val = student_t_one_sided_pvalue(eff_z, df=max(4, len(hist_vols) - 1))
 
     ohlc = np.array(
         [
@@ -300,6 +345,8 @@ def find_anomalies(
             target_price=target_price,
             turnover_cr=turnover_cr,
             is_live_projected=is_proj,
+            p_value=p_val,
+            fdr_q=p_val,
         )
     ]
 
@@ -334,23 +381,40 @@ def backtest_donchian_volume(
     d_upper, _, d_mid = compute_donchian_channels(highs, lows, window=donchian_window)
 
     def _simulate(require_vol: bool):
-        in_pos, entry, risk, stop, hi_close = False, 0.0, 0.0, 0.0, 0.0
+        in_pos, pending_entry = False, False
+        entry, risk, stop, hi_close, pos_weight = 0.0, 0.0, 0.0, 0.0, 1.0
         r_mults, rets = [], []
         eq, peak, max_dd = 1.0, 1.0, 0.0
+        slip_frac = getattr(config, "STOP_SLIPPAGE_ATR_FRAC", 0.10)
+        risk_pct = getattr(config, "RISK_PER_TRADE_PCT", 1.0) / 100.0
 
         for i in range(start_idx, len(closes)):
             c, h, l, o, v = closes[i], highs[i], lows[i], opens[i], vols[i]
             if not np.isfinite(c) or c <= 0:
                 continue
 
+            # Fill pending signal from bar i-1 at bar i's Open (no same-bar close bias)
+            if pending_entry and not in_pos:
+                pending_entry = False
+                entry = o if (np.isfinite(o) and o > 0) else c
+                risk = max(entry * 0.01, config.ATR_STOP_MULT * atr[i - 1])
+                stop = entry - risk
+                hi_close = entry
+                stop_dist_frac = risk / entry
+                pos_weight = min(1.0, risk_pct / stop_dist_frac) if stop_dist_frac > 1e-9 else 1.0
+                in_pos = True
+
             if in_pos:
                 hit_stop = l <= stop
                 if hit_stop or c < d_mid[i] or i == len(closes) - 1:
-                    exit_px = (min(o, stop) if o < stop else stop) if hit_stop else c
+                    raw_exit = (min(o, stop) if o < stop else stop) if hit_stop else c
+                    exit_px = max(0.01, raw_exit - (slip_frac * atr[i] if hit_stop else 0.0))
                     net_ret = ((exit_px - entry) / entry) - (cost_pct / 100.0)
-                    rets.append(net_ret * 100.0)
-                    r_mults.append((net_ret * entry) / risk if risk > 1e-9 else 0.0)
-                    eq *= 1.0 + net_ret
+                    r_mult = (net_ret * entry) / risk if risk > 1e-9 else 0.0
+                    sized_ret = pos_weight * net_ret
+                    rets.append(sized_ret * 100.0)
+                    r_mults.append(r_mult)
+                    eq *= 1.0 + sized_ret
                     peak = max(peak, eq)
                     max_dd = max(max_dd, (peak - eq) / peak)
                     in_pos = False
@@ -359,19 +423,18 @@ def backtest_donchian_volume(
                     stop = max(stop, d_mid[i], hi_close - 2.5 * atr[i])
                 continue
 
-            if c <= d_upper[i] or c < o:
+            if i >= len(closes) - 1 or c <= d_upper[i] or c < o:
                 continue
             if require_vol:
                 clv = (c - l) / (h - l) if (h - l) > 1e-9 else 0.5
                 if clv < config.MIN_CLOSE_STRENGTH:
                     continue
                 _, rvol_i, z_i, mod_z_i = calculate_robust_metrics(vols[i - window : i], v)
-                if rvol_i < min_rvol or max(z_i, mod_z_i) < min_z_score:
+                eff_z_i = mod_z_i if (mod_z_i > z_i * 1.40 and z_i > 0.5) else z_i
+                if rvol_i < min_rvol or eff_z_i < min_z_score:
                     continue
 
-            in_pos, entry, hi_close = True, c, c
-            risk = max(c * 0.01, config.ATR_STOP_MULT * atr[i])
-            stop = entry - risk
+            pending_entry = True
 
         if not rets:
             return 0, 0.0, 0.0, 0.0, 0.0, 0.0

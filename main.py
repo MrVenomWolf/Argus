@@ -15,7 +15,7 @@ import threading
 from typing import Callable, List, Optional
 
 from alerts import log_alerts_to_csv, print_alerts
-from anomaly_engine import Anomaly, find_anomalies
+from anomaly_engine import Anomaly, apply_benjamini_hochberg, find_anomalies
 import config
 from data_sources import equities
 
@@ -91,6 +91,9 @@ def run(
                 only_breakouts=only_breakouts,
             )
         )
+
+    # Apply Benjamini-Hochberg FDR calibration across all tested symbols
+    apply_benjamini_hochberg(all_anomalies, total_tested=len(by_symbol))
 
     # Sort: Actionable Donchian Breakouts first, then highest statistical Z-score
     all_anomalies.sort(

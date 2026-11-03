@@ -1,5 +1,5 @@
 //@version=5
-strategy("NSE Log-Volume Anomaly + Donchian Breakout Strategy", shorttitle="NSE Vol-Donchian", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.075, slippage=2)
+strategy("NSE Log-Volume Anomaly + Donchian Breakout Strategy", shorttitle="NSE Vol-Donchian", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.125, slippage=2)
 
 // ============================================================================
 // 1. INPUT PARAMETERS
@@ -9,43 +9,80 @@ volWindow     = input.int(20,     "Volume Baseline Lookback (W)", minval=5, grou
 minRvol       = input.float(2.0,  "Minimum RVOL (vs Median)", minval=1.0, step=0.1, group=grp_vol)
 minZScore     = input.float(2.5,  "Minimum Log Z-Score (sigma)", minval=1.0, step=0.1, group=grp_vol)
 useLogMad     = input.bool(true,  "Include Robust Log-MAD Z-Score (Anti-Masking)", group=grp_vol)
+useSameSlot   = input.bool(true,  "Intraday Same-Slot Time-of-Day Normalization", group=grp_vol)
+useFutProxy   = input.bool(true,  "Auto-Use NIFTY1!/BANKNIFTY1! Vol on Cash Index", group=grp_vol)
 
 grp_don = "2. Donchian Price Structure & Close Filter"
 donchianLen   = input.int(20,     "Donchian Channel Length (N)", minval=5, group=grp_don)
 minClv        = input.float(0.65, "Min Close Location Value (CLV 0..1)", minval=0.1, maxval=0.95, step=0.05, group=grp_don)
-allowShorts   = input.bool(false, "Enable Short Breakdown Trades (Intraday/F&O)", group=grp_don)
+allowShorts   = input.bool(true,  "Enable Short Breakdown Trades (Intraday/Options)", group=grp_don)
 
-grp_risk = "3. Wilder ATR Risk & Exit Management"
+grp_risk = "3. Wilder ATR Risk, Quick Target & Exit Management"
 atrLen        = input.int(14,     "Wilder ATR Period", minval=5, group=grp_risk)
 atrStopMult   = input.float(2.0,  "Initial Hard Stop (x ATR)", minval=0.5, step=0.25, group=grp_risk)
 atrTrailMult  = input.float(2.5,  "Chandelier Trailing Stop (x ATR)", minval=1.0, step=0.25, group=grp_risk)
+useTakeProfit = input.bool(true,  "Enable Quick Take-Profit Target Limit", group=grp_risk)
+atrTargetMult = input.float(4.0,  "Take-Profit Target (x ATR)", minval=1.0, step=0.5, group=grp_risk)
 showHud       = input.bool(true,  "Show Live Quantitative HUD Table", group=grp_risk)
 
 // ============================================================================
-// 2. OUTLIER-RESISTANT VOLUME MATH (STRICTLY SHIFTED [1] TO EXCLUDE CURRENT BAR)
+// 2. VOLUME RESOLUTION (AUTO FUTURES PROXY FOR NIFTY / BANKNIFTY SPOT INDEX)
 // ============================================================================
-float logVol = math.log(1.0 + math.max(0.0, volume))
+string proxyTicker = str.contains(syminfo.ticker, "BANK") ? "NSE:BANKNIFTY1!" : "NSE:NIFTY1!"
+float  futVol      = request.security(proxyTicker, timeframe.period, volume, barmerge.gaps_off, barmerge.lookahead_off)
+bool   usingProxy  = useFutProxy and (na(volume) or volume <= 0)
+float  rawVol      = usingProxy ? nz(futVol, 0.0) : nz(volume, 0.0)
+float  logVol      = math.log(1.0 + math.max(0.0, rawVol))
 
-float baselineMedianVol = ta.median(volume[1], volWindow)
-float rvol              = baselineMedianVol > 0 ? (volume / baselineMedianVol) : 1.0
+// ============================================================================
+// 3. OUTLIER-RESISTANT VOLUME MATH (WITH INTRADAY SAME-SLOT NORMALIZATION)
+// ============================================================================
+var float[] slotVolArr = array.new_float(0)
+var float[] slotLogArr = array.new_float(0)
+var float[] absDevArr  = array.new_float(0)
+array.clear(slotVolArr)
+array.clear(slotLogArr)
+array.clear(absDevArr)
 
-float logMean = ta.sma(logVol[1], volWindow)
-float logStd  = ta.stdev(logVol[1], volWindow)
+int curH = hour(time)
+int curM = minute(time)
+
+if timeframe.isintraday and useSameSlot
+    int maxLookback = math.min(bar_index, 1200)
+    for k = 1 to maxLookback
+        if hour(time[k]) == curH and minute(time[k]) == curM and rawVol[k] > 0
+            array.push(slotVolArr, rawVol[k])
+            array.push(slotLogArr, logVol[k])
+            if array.size(slotVolArr) >= volWindow
+                break
+
+bool hasSlotHist = array.size(slotVolArr) >= 5
+
+// Sample standard deviation uses `biased=false` (ddof=1) to match Python exactly
+float baselineMedianVol = hasSlotHist ? array.median(slotVolArr) : ta.median(rawVol[1], volWindow)
+float rvol              = baselineMedianVol > 0 ? (rawVol / baselineMedianVol) : 1.0
+
+float logMean = hasSlotHist ? array.avg(slotLogArr) : ta.sma(logVol[1], volWindow)
+float logStd  = hasSlotHist ? array.stdev(slotLogArr, false) : ta.stdev(logVol[1], volWindow, false)
 float logZ    = logStd > 1e-9 ? (logVol - logMean) / logStd : 0.0
 
-float logMed  = ta.median(logVol[1], volWindow)
-var float[] absDevArr = array.new_float(0)
-array.clear(absDevArr)
-for i = 1 to volWindow
-    array.push(absDevArr, math.abs(logVol[i] - logMed))
-float logMad      = array.median(absDevArr)
-float modifiedZ   = logMad > 1e-9 ? (0.67449 * (logVol - logMed)) / logMad : logZ
+float logMed  = hasSlotHist ? array.median(slotLogArr) : ta.median(logVol[1], volWindow)
+if hasSlotHist
+    for idx = 0 to array.size(slotLogArr) - 1
+        array.push(absDevArr, math.abs(array.get(slotLogArr, idx) - logMed))
+else
+    for i = 1 to volWindow
+        array.push(absDevArr, math.abs(logVol[i] - logMed))
 
-float effectiveZ   = useLogMad ? math.max(logZ, modifiedZ) : logZ
-bool  isVolAnomaly = (rvol >= minRvol) and (effectiveZ >= minZScore)
+float logMad    = array.size(absDevArr) > 0 ? array.median(absDevArr) : 0.0
+float modifiedZ = logMad > 1e-9 ? (0.67449 * (logVol - logMed)) / logMad : logZ
+
+// Anti-masking promotion: use modifiedZ only when a prior outlier inflated sample std
+float effectiveZ   = (useLogMad and modifiedZ > logZ * 1.40 and logZ > 0.5) ? modifiedZ : logZ
+bool  isVolAnomaly = barstate.isconfirmed and (rvol >= minRvol) and (effectiveZ >= minZScore)
 
 // ============================================================================
-// 3. SHIFTED DONCHIAN CHANNELS, CLV & WILDER ATR
+// 4. SHIFTED DONCHIAN CHANNELS, CLV & WILDER ATR
 // ============================================================================
 float donUpper = ta.highest(high, donchianLen)[1]
 float donLower = ta.lowest(low, donchianLen)[1]
@@ -59,34 +96,39 @@ bool longBreakout   = isVolAnomaly and (close > donUpper) and (clv >= minClv) an
 bool shortBreakdown = isVolAnomaly and (close < donLower) and (clv <= (1.0 - minClv)) and (close <= open)
 
 // ============================================================================
-// 4. STRATEGY EXECUTION & DYNAMIC TRAILING STOP
+// 5. STRATEGY EXECUTION & IMMEDIATE FILL-BAR STOP + TARGET ARMING
 // ============================================================================
 var float activeStop   = na
+var float activeTarget = na
 var float highestClose = na
 var float lowestClose  = na
 
 if strategy.position_size == 0
     if longBreakout
         activeStop   := close - (atrStopMult * atrVal)
+        activeTarget := useTakeProfit ? close + (atrTargetMult * atrVal) : na
         highestClose := close
         strategy.entry("Long Breakout", strategy.long, alert_message="VOL+DON LONG BREAKOUT")
+        strategy.exit("Long Exit", from_entry="Long Breakout", stop=activeStop, limit=activeTarget, alert_message="LONG EXIT")
     else if allowShorts and shortBreakdown
         activeStop   := close + (atrStopMult * atrVal)
+        activeTarget := useTakeProfit ? math.max(0.01, close - (atrTargetMult * atrVal)) : na
         lowestClose  := close
         strategy.entry("Short Breakdown", strategy.short, alert_message="VOL+DON SHORT BREAKDOWN")
+        strategy.exit("Short Exit", from_entry="Short Breakdown", stop=activeStop, limit=activeTarget, alert_message="SHORT EXIT")
 else if strategy.position_size > 0
     highestClose := math.max(nz(highestClose, close), close)
     float chandelierStop = highestClose - (atrTrailMult * atrVal)
-    activeStop   := math.max(nz(activeStop, chandelierStop), math.max(donMid, chandelierStop))
-    strategy.exit("Long Trail Exit", from_entry="Long Breakout", stop=activeStop, alert_message="LONG TRAIL EXIT")
+    activeStop := math.max(nz(activeStop, chandelierStop), math.max(donMid, chandelierStop))
+    strategy.exit("Long Exit", from_entry="Long Breakout", stop=activeStop, limit=activeTarget, alert_message="LONG EXIT")
 else if strategy.position_size < 0
-    lowestClose  := math.min(nz(lowestClose, close), close)
+    lowestClose := math.min(nz(lowestClose, close), close)
     float chandelierStop = lowestClose + (atrTrailMult * atrVal)
-    activeStop   := math.min(nz(activeStop, chandelierStop), math.min(donMid, chandelierStop))
-    strategy.exit("Short Trail Exit", from_entry="Short Breakdown", stop=activeStop, alert_message="SHORT TRAIL EXIT")
+    activeStop := math.min(nz(activeStop, chandelierStop), math.min(donMid, chandelierStop))
+    strategy.exit("Short Exit", from_entry="Short Breakdown", stop=activeStop, limit=activeTarget, alert_message="SHORT EXIT")
 
 // ============================================================================
-// 5. VISUAL PLOTS, SIGNALS & LIVE HUD
+// 6. VISUAL PLOTS, SIGNALS & LIVE HUD
 // ============================================================================
 pUpper = plot(donUpper, "Donchian Upper (Prior N)", color=color.new(#00e676, 25), linewidth=2)
 pMid   = plot(donMid,   "Donchian Mid (Basis/Trail)", color=color.new(#ffab40, 35), linewidth=1, style=plot.style_circles)
@@ -94,6 +136,7 @@ pLower = plot(donLower, "Donchian Lower (Prior N)", color=color.new(#ff5252, 25)
 fill(pUpper, pLower, color=color.new(#007acc, 92), title="Donchian Channel Fill")
 
 plot(strategy.position_size != 0 ? activeStop : na, "Active Trailing Stop", color=color.new(#ff1744, 0), linewidth=2, style=plot.style_linebr)
+plot(strategy.position_size != 0 and useTakeProfit ? activeTarget : na, "Active Profit Target", color=color.new(#00e676, 0), linewidth=2, style=plot.style_linebr)
 
 plotshape(longBreakout, title="Long Breakout", style=shape.triangleup, location=location.belowbar, color=#00e676, size=size.small, text="BO")
 plotshape(shortBreakdown, title="Short Breakdown", style=shape.triangledown, location=location.abovebar, color=#ff5252, size=size.small, text="BD")
@@ -101,8 +144,11 @@ barcolor(longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c
 
 if showHud and barstate.islast
     var table hud = table.new(position.top_right, 2, 7, bgcolor=color.new(#18181c, 10), border_color=#333338, border_width=1)
+    bool   isShortBias = shortBreakdown or strategy.position_size < 0
     string sigText = longBreakout ? "LONG BREAKOUT" : shortBreakdown ? "SHORT BREAKDOWN" : isVolAnomaly ? "VOL ANOMALY" : "NORMAL"
     color  sigCol  = longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c4ff : #aaaaaa
+    float  hudStop = isShortBias ? (close + atrStopMult * atrVal) : (close - atrStopMult * atrVal)
+    float  hudTgt  = isShortBias ? math.max(0.0, close - atrTargetMult * atrVal) : (close + atrTargetMult * atrVal)
 
     table.cell(hud, 0, 0, "SIGNAL STATE", text_color=#aaaaaa, text_size=size.small)
     table.cell(hud, 1, 0, sigText, text_color=sigCol, text_size=size.small)
@@ -122,5 +168,5 @@ if showHud and barstate.islast
     table.cell(hud, 0, 5, "Donchian High / Low", text_color=#aaaaaa, text_size=size.small)
     table.cell(hud, 1, 5, str.tostring(donUpper, "#.##") + " / " + str.tostring(donLower, "#.##"), text_color=#ffffff, text_size=size.small)
 
-    table.cell(hud, 0, 6, "2xATR Stop / 2R Target", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 6, str.tostring(close - 2 * atrVal, "#.##") + " / " + str.tostring(close + 4 * atrVal, "#.##"), text_color=#ffab40, text_size=size.small)
+    table.cell(hud, 0, 6, "ATR Stop / Target", text_color=#aaaaaa, text_size=size.small)
+    table.cell(hud, 1, 6, str.tostring(hudStop, "#.##") + " / " + str.tostring(hudTgt, "#.##"), text_color=#ffab40, text_size=size.small)

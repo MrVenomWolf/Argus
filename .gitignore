@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 venv/
 MATH_AND_CHANGES_EXPLAINED.txt
+alerts_log.csv
