@@ -11,7 +11,7 @@ Includes both a **dark-themed Python Desktop Terminal (`gui.py`)** for market-wi
 ## Key Features
 
 * **Multi-Market Universe Coverage (`ALL_NSE`, `NIFTY_500`, `NIFTY_200`, `SPX_500`)**: Dynamically fetches active NSE equities from `EQUITY_L.csv` (with a configurable default `₹1 Cr` minimum median daily turnover filter to exclude illiquid micro-caps) as well as **`^GSPC`, `SPY`, and 503 S&P 500 US constituents** (`SPX_500`), formatting prices and turnover in **`₹` (`₹ Cr`)** or **`$` (`$M`)**.
-* **Calibrated Dual-Z Volume Engine**: Uses **Parametric Log-Volume Z-Score** (`ddof=1`) by default and promotes the **Non-Parametric Log-MAD Modified Z-Score** (Iglewicz & Hoaglin, 1993 in log-space) specifically when a prior outlier in the 20-bar window inflates sample standard deviation (*outlier-masking protection* without inflating the false-positive rate on clean data). Also computes one-sided Student-$t$ ($df = W-1$) p-values and **Benjamini-Hochberg False Discovery Rate (`fdr_q`)** across the scanned universe.
+* **Calibrated Dual-Z Volume Engine**: Uses **Parametric Log-Volume Z-Score** (`ddof=1`) by default and promotes the **Non-Parametric Log-MAD Modified Z-Score** (Iglewicz & Hoaglin, 1993 in log-space) specifically when a prior outlier in the 20-bar window inflates sample standard deviation (*outlier-masking protection* without inflating the false-positive rate on clean data). Also computes one-sided Student-`t (df = W - 1)` p-values and **Benjamini-Hochberg False Discovery Rate (`fdr_q`)** across the scanned universe.
 * **Directional Price Structure (Shifted Donchian + CLV)**: Evaluates volume surges against a **1-bar shifted 20-period Donchian Channel** (`[t-20 ... t-1]`) and **Close Location Value (`CLV >= 0.65`)** to distinguish confirmed breakouts (`LONG BREAKOUT` / `SHORT BREAKDOWN`) from upper-wick bull traps.
 * **Intraday & Partial-Session Volume Normalization**:
   * **Intraday Same-Slot Matching (`15m`, `1h`)**: Converts timestamps to each exchange's native timezone (`Asia/Kolkata` for `.NS`, `America/New_York` for US) and matches current volume against historical bars from the **exact same `(hour, minute)` slot** in both Python and Pine Script.
@@ -33,7 +33,7 @@ Trading volume is **strictly positive and right-skewed (approximately log-normal
 | **Relative Volume (RVOL)** | `RVOL_t = V_t / Med_V` | Enforces **economic magnitude** vs. typical trading activity |
 | **Parametric Log Z-Score** | `Z_log = (ln(1 + V_t) - μ_log) / σ_log` | Corrects for volume's log-normal skewness using Bessel-corrected sample std (`ddof=1`) |
 | **Robust Log-MAD Z-Score** | `Z_mad = 0.6745 × (ln(1 + V_t) - Med_log) / MAD_log` | Promoted when `Z_mad > 1.4 × Z_log` to prevent **variance masking** from a prior spike in the window |
-| **FDR Calibration** | `q_i = min_{k >= i} (p_k × M / k)` | Benjamini-Hochberg (1995) False Discovery Rate across `M` tested equities using Student-$t_{19}$ tails |
+| **FDR Calibration** | `q_i = min_{k >= i} (p_k × M / k)` | Benjamini-Hochberg (1995) False Discovery Rate across `M` tested equities using Student-`t (df=19)` tails |
 | **Shifted Donchian Channel** | `Upper_t = max(H_{t-20...t-1})`, `Lower_t = min(L_{t-20...t-1})` | Strictly shifted by 1 bar so `Close_t > Upper_t` confirms absorption of prior 20-bar resistance |
 | **Close Location Value (CLV)** | `CLV_t = (Close_t - Low_t) / (High_t - Low_t)` | Rejects upper-wick rejection candles (requires `CLV_t >= 0.65` for long breakouts) |
 | **Wilder's ATR(14)** | `ATR_t = (1/14) × TR_t + (13/14) × ATR_{t-1}` | Sizes 1% fixed-fractional risk position and sets initial Stop (`Entry - 2×ATR`) & Target (`Entry + 4×ATR`) |
@@ -62,6 +62,32 @@ git clone https://github.com/MrVenomWolf/NSE-Trade-Anomaly-Detector.git
 cd NSE-Trade-Anomaly-Detector
 pip install -r requirements.txt
 ```
+
+### Required Packages (`requirements.txt`)
+* `pandas>=2.2.0,<4.0.0` — Vectorized rolling Donchian channels & OHLCV time-series handling
+* `numpy>=1.26.0,<3.0.0` — Log-space Z-score, MAD, and Wilder ATR array computations
+* `yfinance>=0.2.50,<2.0.0` — Batched multi-ticker OHLCV fetching (`auto_adjust=True`)
+* `matplotlib>=3.8.0,<4.0.0` — Dark-themed price, Donchian channel, and volume charting
+* `requests>=2.31.0,<3.0.0` — Dynamic NSE (`EQUITY_L.csv`) and S&P 500 universe fetching
+
+---
+
+## Configuration (`config.py`)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `MIN_Z_SCORE` | `2.5` | Minimum log-normalized Z-score threshold (`~99.4th` percentile) |
+| `MIN_RVOL` | `2.0` | Minimum relative volume multiplier vs. 20-bar rolling median |
+| `BASELINE_WINDOW` | `20` | Historical lookback window (`W`) for volume baseline & Z-score |
+| `DONCHIAN_WINDOW` | `20` | Prior `N` bars (`[t-N ... t-1]`) for shifted Donchian Upper/Lower bands |
+| `ATR_PERIOD` | `14` | Wilder's Average True Range lookback period (`RMA`, `alpha = 1/14`) |
+| `ATR_STOP_MULT` | `2.0` | Initial hard stop-loss distance (`2.0 × ATR`) |
+| `ATR_TARGET_MULT` | `4.0` | Initial `2R` take-profit distance (`4.0 × ATR`) |
+| `MIN_CLOSE_STRENGTH` | `0.65` | Minimum Close Location Value (`CLV >= 65%` for long breakouts) |
+| `MIN_MEDIAN_TURNOVER_CR` | `1.0` | Minimum 20-day median daily turnover (`₹1 Cr`) for daily NSE scans |
+| `NSE_ROUND_TRIP_COST_PCT` | `0.25` | Round-trip transaction cost (`0.25%`) deducted per backtested trade |
+| `STOP_SLIPPAGE_ATR_FRAC` | `0.10` | Adverse stop-fill slippage (`0.10 × ATR`) deducted on stop exits |
+| `RISK_PER_TRADE_PCT` | `1.0` | Fixed-fractional portfolio equity (`1.0%`) risked per backtested trade |
 
 ---
 

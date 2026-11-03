@@ -123,7 +123,7 @@ def fetch_equities_batch(
                     period=resolved_period,
                     interval=interval,
                     group_by="ticker",
-                    auto_adjust=False,
+                    auto_adjust=True,
                     threads=True,
                     progress=False,
                 )
