@@ -25,8 +25,10 @@ ATR_PERIOD = 14
 ATR_STOP_MULT = 2.0
 ATR_TARGET_MULT = 4.0
 MIN_CLOSE_STRENGTH = 0.65
-MIN_MEDIAN_TURNOVER_CR = 0.0
-NSE_ROUND_TRIP_COST_PCT = 0.15
+MIN_MEDIAN_TURNOVER_CR = 1.0
+NSE_ROUND_TRIP_COST_PCT = 0.25   # 0.25% round-trip NSE delivery (0.1% STT/side + exchange/GST/stamp)
+STOP_SLIPPAGE_ATR_FRAC = 0.10    # 0.10 * ATR adverse slippage on stop-loss fills
+RISK_PER_TRADE_PCT = 1.0         # 1.0% fixed-fractional equity risk per trade sized by 2xATR stop
 
 ALERT_LOG_FILE = "alerts_log.csv"
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
@@ -82,5 +84,10 @@ def get_all_nse_stocks() -> List[str]:
     return get_nse_stocks("ALL_NSE")
 
 
-# Every listed ticker on the NSE (~2,600+ stocks)
-EQUITY_TICKERS: List[str] = get_all_nse_stocks()
+def __getattr__(name: str):
+    """PEP 562 lazy module attribute so `import config` triggers zero network I/O."""
+    if name == "EQUITY_TICKERS":
+        tickers = get_all_nse_stocks()
+        globals()["EQUITY_TICKERS"] = tickers
+        return tickers
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

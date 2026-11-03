@@ -1,8 +1,8 @@
-# NSE & S&P 500 Trade Anomaly + Donchian Breakout Detector
+# NSE & S&P 500 Volume-Breakout Screener & Strategy Engine
 
-A high-throughput, quantitative volume-anomaly and price-structure scanner for the **Indian Stock Market (NSE — 2,635+ listed equities)** and the **US S&P 500 (`SPX_500`)**. It scans entire market universes in rate-limit-safe batches, combining **outlier-resistant log-volume statistics (Parametric Log-Z + Non-Parametric Log-MAD Z)** with **1-bar shifted Donchian Channels, Close Location Value (CLV), Wilder's ATR(14) risk levels, and an embedded Strategy Backtester**.
+A multithreaded quantitative volume-breakout screener and backtesting engine for the **Indian Stock Market (NSE — 2,635+ listed equities)** and the **US S&P 500 (`SPX_500`)**. It scans equity universes in rate-limit-safe batches, combining **outlier-resistant log-volume statistics (Parametric Log-Z, Non-Parametric Log-MAD Z, and Benjamini-Hochberg FDR calibration)** with **1-bar shifted Donchian Channels, Close Location Value (CLV), Wilder's ATR(14) risk sizing, and a Next-Bar-Open Strategy Backtester**.
 
-Includes both a **dark-themed Python Quantitative Desktop Terminal (`gui.py`)** for market-wide screening and **TradingView Pine Script v5 Strategies (`pinescript/`)** for real-time tick-by-tick chart execution on NSE and SPX/US equities.
+Includes both a **dark-themed Python Desktop Terminal (`gui.py`)** for market-wide screening and **TradingView Pine Script v5 Strategies (`pinescript/`)** for chart-level execution and backtesting on NSE and SPX/US equities.
 
 ![NSE Trade Anomaly Detector dashboard](docs/dashboard.png)
 
@@ -10,15 +10,14 @@ Includes both a **dark-themed Python Quantitative Desktop Terminal (`gui.py`)** 
 
 ## Key Features
 
-* **Multi-Market Universe Coverage (`ALL_NSE`, `NIFTY_500`, `NIFTY_200`, `SPX_500`)**: Dynamically fetches all **2,635+ active NSE equities** directly from `EQUITY_L.csv` as well as **`^GSPC`, `SPY`, and all 503 S&P 500 US constituents** (`SPX_500`), automatically formatting prices and turnover in **`₹` (`₹ Cr`)** or **`$` (`$M`)**.
-* **Dual-Z Statistical Volume Engine**: Combines **Parametric Log-Volume Z-Score** (`ddof=1`) with **Non-Parametric Log-MAD Modified Z-Score** (Iglewicz & Hoaglin, 1993 in log-space) so a single prior earnings spike inside the 20-bar window cannot mask a fresh institutional breakout (*variance-masking immunity*).
-* **Directional Price Structure (Shifted Donchian + CLV)**: Evaluates volume anomalies against a **1-bar shifted 20-period Donchian Channel** (`[t-20 ... t-1]`) and **Close Location Value (`CLV >= 0.65`)** to separate genuine institutional breakouts (`LONG BREAKOUT` / `SHORT BREAKDOWN`) from upper-wick bull traps.
-* **Intraday & Live Session Volume Normalization**:
-  * **Live Daily Projection (`1d`)**: During live NSE market hours (`09:15–15:30 IST`), partial daily volume is normalized against an empirical NSE intraday U-curve participation profile so breakouts are caught **live** rather than 1 day late.
-  * **Intraday Slot Matching (`15m`, `1h`)**: Matches intraday bars against historical volume from the **exact same time-of-day slot** to eliminate morning open U-curve false alarms.
-* **Rate-Limit-Safe Batch Pipeline**: Uses chunked multi-ticker batching (`yf.download`) and an in-memory OHLCV DataFrame cache so scanning thousands of tickers avoids Yahoo Finance HTTP 429 bans and clicking any stock in the GUI renders its chart in `<5ms`.
-* **Built-In Historical Strategy Backtester**: Simulates taking every Volume-Confirmed Donchian Breakout with a `2× Wilder ATR(14)` initial stop, a Chandelier / Donchian Mid trailing stop, and **0.15% round-trip transaction costs**, directly comparing net performance against raw unfiltered Donchian breakouts.
-* **TradingView Pine Script v5 Strategies**: Ready-to-paste scripts for **NSE (`nse_anomaly_donchian.pine`)** and **SPX / US Equities (`spx_anomaly_donchian.pine` with automatic `AMEX:SPY` volume proxy)**.
+* **Multi-Market Universe Coverage (`ALL_NSE`, `NIFTY_500`, `NIFTY_200`, `SPX_500`)**: Dynamically fetches active NSE equities from `EQUITY_L.csv` (with a configurable default `₹1 Cr` minimum median daily turnover filter to exclude illiquid micro-caps) as well as **`^GSPC`, `SPY`, and 503 S&P 500 US constituents** (`SPX_500`), formatting prices and turnover in **`₹` (`₹ Cr`)** or **`$` (`$M`)**.
+* **Calibrated Dual-Z Volume Engine**: Uses **Parametric Log-Volume Z-Score** (`ddof=1`) by default and promotes the **Non-Parametric Log-MAD Modified Z-Score** (Iglewicz & Hoaglin, 1993 in log-space) specifically when a prior outlier in the 20-bar window inflates sample standard deviation (*outlier-masking protection* without inflating the false-positive rate on clean data). Also computes one-sided Student-$t$ ($df = W-1$) p-values and **Benjamini-Hochberg False Discovery Rate (`fdr_q`)** across the scanned universe.
+* **Directional Price Structure (Shifted Donchian + CLV)**: Evaluates volume surges against a **1-bar shifted 20-period Donchian Channel** (`[t-20 ... t-1]`) and **Close Location Value (`CLV >= 0.65`)** to distinguish confirmed breakouts (`LONG BREAKOUT` / `SHORT BREAKDOWN`) from upper-wick bull traps.
+* **Intraday & Partial-Session Volume Normalization**:
+  * **Intraday Same-Slot Matching (`15m`, `1h`)**: Converts timestamps to each exchange's native timezone (`Asia/Kolkata` for `.NS`, `America/New_York` for US) and matches current volume against historical bars from the **exact same `(hour, minute)` slot** in both Python and Pine Script.
+  * **Partial-Session Projection (`1d`)**: After 10:00 AM IST (at least 45 minutes into the NSE session), scales in-progress daily volume using a parametric U-curve session approximation (`t + 0.14 * sin(2πt)`).
+* **Realistic Next-Open & Risk-Sized Backtester**: Evaluates signals at bar `i` and enters at **next bar's Open (`Open[i+1]`)**, sizes positions via **1% Fixed-Fractional Equity Risk** divided by the `2× Wilder ATR(14)` stop distance, deducts **`0.25%` round-trip NSE delivery costs** plus **`0.10 × ATR` stop-fill slippage**, and compares against raw unfiltered Donchian breakouts.
+* **TradingView Pine Script v5 Strategies**: Parity-matched scripts (`biased=false` sample std, intraday same-slot volume arrays, `barstate.isconfirmed` anti-repainting, immediate fill-bar stop/target arming) for **NSE (`nse_anomaly_donchian.pine`)** and **SPX / US Equities (`spx_anomaly_donchian.pine`)**.
 
 ---
 
@@ -26,34 +25,33 @@ Includes both a **dark-themed Python Quantitative Desktop Terminal (`gui.py`)** 
 
 ![Anomaly detection pipeline](docs/methodology_diagram.svg)
 
-Trading volume is **strictly positive and right-skewed (approximately log-normal)** — a naive percentage-change or simple moving average (SMA) baseline is easily distorted by prior spikes. This engine pairs robust log-space statistics with price-structure confirmation:
+Trading volume is **strictly positive and right-skewed (approximately log-normal)** — a naive percentage-change or simple moving average (SMA) baseline is easily distorted by prior spikes. This engine pairs log-space statistics with price-structure confirmation:
 
 | Metric | Formula | Quantitative Purpose |
 |---|---|---|
 | **Volume Baseline** | `Med_V = median(V_{t-20} ... V_{t-1})` | Outlier-resistant baseline (50% breakdown point), strictly excluding bar `t` |
 | **Relative Volume (RVOL)** | `RVOL_t = V_t / Med_V` | Enforces **economic magnitude** vs. typical trading activity |
 | **Parametric Log Z-Score** | `Z_log = (ln(1 + V_t) - μ_log) / σ_log` | Corrects for volume's log-normal skewness using Bessel-corrected sample std (`ddof=1`) |
-| **Robust Log-MAD Z-Score** | `Z_mad = 0.6745 × (ln(1 + V_t) - Med_log) / MAD_log` | Prevents **variance masking** when a prior earnings spike sits inside the 20-bar window |
-| **Shifted Donchian Channel** | `Upper_t = max(H_{t-20...t-1})`, `Lower_t = min(L_{t-20...t-1})` | Strictly shifted by 1 bar so `Close_t > Upper_t` confirms absorption of overhead supply |
-| **Close Location Value (CLV)** | `CLV_t = (Close_t - Low_t) / (High_t - Low_t)` | Rejects upper-wick "shooting star" bull traps (requires `CLV_t >= 0.65` for longs) |
-| **Wilder's ATR(14)** | `ATR_t = (1/14) × TR_t + (13/14) × ATR_{t-1}` | Sizes volatility-adjusted initial Stop-Loss (`Close - 2×ATR`) and 2R Target (`Close + 4×ATR`) |
+| **Robust Log-MAD Z-Score** | `Z_mad = 0.6745 × (ln(1 + V_t) - Med_log) / MAD_log` | Promoted when `Z_mad > 1.4 × Z_log` to prevent **variance masking** from a prior spike in the window |
+| **FDR Calibration** | `q_i = min_{k >= i} (p_k × M / k)` | Benjamini-Hochberg (1995) False Discovery Rate across `M` tested equities using Student-$t_{19}$ tails |
+| **Shifted Donchian Channel** | `Upper_t = max(H_{t-20...t-1})`, `Lower_t = min(L_{t-20...t-1})` | Strictly shifted by 1 bar so `Close_t > Upper_t` confirms absorption of prior 20-bar resistance |
+| **Close Location Value (CLV)** | `CLV_t = (Close_t - Low_t) / (High_t - Low_t)` | Rejects upper-wick rejection candles (requires `CLV_t >= 0.65` for long breakouts) |
+| **Wilder's ATR(14)** | `ATR_t = (1/14) × TR_t + (13/14) × ATR_{t-1}` | Sizes 1% fixed-fractional risk position and sets initial Stop (`Entry - 2×ATR`) & Target (`Entry + 4×ATR`) |
 
-**Actionable Breakout Rules:**
-* **Volume Anomaly Gate:** `RVOL_t >= 2.0x` **AND** `max(Z_log, Z_mad) >= 2.5σ`
+**Signal Classification Rules:**
+* **Volume Anomaly Gate:** `RVOL_t >= 2.0x` **AND** `Effective_Z >= 2.5σ`
 * **Long Breakout (`LONG BREAKOUT`):** `Close_t > Upper_t` **AND** `CLV_t >= 0.65` **AND** `Close_t >= Open_t`
 * **Short Breakdown (`SHORT BREAKDOWN`):** `Close_t < Lower_t` **AND** `CLV_t <= 0.35` **AND** `Close_t <= Open_t`
 * **Pre-Breakout Accumulation (`BULLISH ACCUM`):** Volume Gate passed **AND** `Close_t >= DonchianMid_t` **AND** `CLV_t >= 0.65`
 
 ---
 
-## Live Market Execution Workflow
+## Discretionary Execution Workflow
 
 ![Live Execution Workflow](docs/execution_workflow.svg)
 
-Because `DonchianUpper_t = max(High_{t-20 ... t-1})` only depends on the **prior 20 completed bars**, the exact breakout price ceiling is known *before* the current bar finishes:
-1. **Spot Pre-Breakout Accumulation (`BULLISH ACCUM`)**: The scanner flags stocks where institutional volume (`RVOL >= 2.0x`, `Z >= 2.5σ`) is already absorbing supply just underneath the 20-period Donchian High.
-2. **Park a Resting Buy Stop-Limit (`SL` Buy) Order**: Place a trigger order at `DonchianUpper + 1 tick` directly on the exchange server. If price rejects off resistance, the order never triggers (`0` loss). If an institution sweeps the book in 1 second, the exchange fills your order at the exact breakout level in microseconds.
-3. **Manage Risk with Wilder's ATR(14)**: Place the initial hard stop at `Entry - 2.0 × ATR(14)` and trail winners with `max(DonchianMid, HighestClose - 2.5 × ATR(14))`.
+1. **Next-Bar-Open Execution (Backtested Mode)**: When a stock closes above `DonchianUpper` with confirmed volume (`LONG BREAKOUT`), entry is modeled at the **next bar's Open**, with position size scaled so the `2.0 × ATR(14)` stop equals `1.0%` of account equity.
+2. **Pre-Breakout Stop-Limit Workflow (Discretionary Mode)**: Because `DonchianUpper_t = max(High_{t-20 ... t-1})` is fixed for the duration of bar `t`, traders monitoring `BULLISH ACCUM` setups can place a resting **Buy Stop-Limit (`SL` Buy)** order at `DonchianUpper + 1 tick` via their broker terminal, managing downside with the `2.0 × ATR(14)` hard stop and trailing via `max(DonchianMid, HighestClose - 2.5 × ATR(14))`.
 
 ---
 
@@ -73,19 +71,19 @@ pip install -r requirements.txt
 ```bash
 python gui.py
 ```
-* Select your **Universe** (`ALL_NSE` for all 2,635+ listed NSE stocks, `NIFTY_500`, `NIFTY_200`, or `SPX_500` for `^GSPC` + `SPY` + 503 S&P 500 US equities) and **Timeframe** (`15m`, `1h`, or `1d`).
+* Select your **Universe** (`ALL_NSE`, `NIFTY_500`, `NIFTY_200`, or `SPX_500`) and **Timeframe** (`15m`, `1h`, or `1d`).
 * Click **RUN LIVE SCAN** (and toggle **Donchian Breakouts Only** to filter directly to confirmed breakouts).
-* Click any flagged stock in the table to inspect its **Donchian Channel overlay**, **2xATR Stop / 4xATR Target lines**, **20-bar Median Volume Baseline**, and **Historical Strategy Backtest**.
+* Click any flagged stock in the table to inspect its **Donchian Channel overlay**, **2xATR Stop / 4xATR Target lines**, **20-bar Median Volume Baseline**, and **Next-Open Risk-Sized Strategy Backtest**.
 
 ### 2. Command Line Scanner (CLI)
 ```bash
-# Scan all 2,635+ NSE stocks on daily candles
+# Scan all liquid NSE stocks on daily candles
 python main.py
 
 # Scan S&P 500 (^GSPC, SPY + 503 US equities) on daily or intraday candles
 python main.py --universe SPX_500 --interval 1d
 
-# Scan Nifty 200 on live 15-minute intraday candles for confirmed Donchian breakouts only
+# Scan Nifty 200 on 15-minute intraday candles for confirmed Donchian breakouts only
 python main.py --universe NIFTY_200 --interval 15m --breakouts-only
 
 # Custom thresholds
@@ -93,10 +91,10 @@ python main.py --rvol 2.5 --z-score 3.0
 ```
 
 ### 3. TradingView Pine Script v5 Strategies (NSE & SPX / US Markets)
-* **For NSE Stocks:** Copy `pinescript/nse_anomaly_donchian.pine`
-* **For S&P 500 (`SPX` / `SPY` / `ES1!`) & US Stocks:** Copy `pinescript/spx_anomaly_donchian.pine` *(includes automatic `AMEX:SPY` ETF volume proxy fallback when loaded on the cash `SPX` index, which lacks native tick volume on TradingView, plus bidirectional Long/Short execution)*.
+* **For NSE Stocks & Nifty/BankNifty Options:** Copy `pinescript/nse_anomaly_donchian.pine` *(includes automatic `NSE:NIFTY1!` / `NSE:BANKNIFTY1!` futures volume proxy when loaded on cash index charts, plus intraday same-slot normalization and quick take-profit targets)*.
+* **For S&P 500 (`SPX` / `SPY` / `ES1!`) & US Stocks:** Copy `pinescript/spx_anomaly_donchian.pine` *(includes automatic `AMEX:SPY` ETF volume proxy when loaded on the cash `SPX` index)*.
 1. In TradingView, open the **Pine Editor**, clear any existing template (`Ctrl+A` then `Backspace`), paste the script, and click **Add to chart**.
-2. Open TradingView's **Strategy Tester** tab to inspect live backtest metrics across `5m`, `15m`, `1H`, or `1D` timeframes.
+2. Open TradingView's **Strategy Tester** tab to inspect backtest metrics across `5m`, `15m`, `1H`, or `1D` timeframes.
 
 ### 4. Automated Test Suite
 ```bash
@@ -108,25 +106,35 @@ python test_suite.py
 ## Project Architecture
 
 ```text
-├── config.py                        <- Thresholds & cached dynamic universe loader (ALL_NSE / Nifty 500 / Nifty 200 / SPX_500)
-├── anomaly_engine.py                <- Vectorized math engine (Log-Z, Log-MAD Z, Donchian, CLV, Wilder ATR, Backtester)
+├── config.py                        <- Thresholds & lazy-loaded universe fetcher (ALL_NSE / Nifty 500 / Nifty 200 / SPX_500)
+├── anomaly_engine.py                <- Vectorized engine (Log-Z, Log-MAD Z, Student-t FDR, Donchian, CLV, Wilder ATR, Backtester)
 ├── alerts.py                        <- Console reporting & 17-column CSV alert logger
-├── main.py                          <- CLI entry point with batched scanning & signal prioritization
+├── main.py                          <- CLI entry point with batched scanning, BH-FDR calibration & signal prioritization
 ├── gui.py                           <- Non-blocking dark Tkinter + Matplotlib quantitative terminal
-├── test_suite.py                    <- 11 unit & integration tests verifying math, edge cases, and pipeline
+├── test_suite.py                    <- Unit & integration tests verifying math, timezones, risk sizing, and pipeline
+├── .github/workflows/tests.yml      <- GitHub Actions CI pipeline running test_suite.py on push/PR
 ├── docs/
-│   ├── dashboard.png                <- v2 Quantitative Desktop Terminal preview
+│   ├── dashboard.png                <- Quantitative Desktop Terminal preview
 │   ├── methodology_diagram.svg      <- 5-stage statistical & price-structure pipeline diagram
-│   └── execution_workflow.svg       <- 3-stage live market SL order execution diagram
+│   └── execution_workflow.svg       <- Execution & ATR risk-sizing workflow diagram
 ├── data_sources/
 │   └── equities.py                  <- Rate-limit-resistant batched OHLCV fetcher & in-memory DataFrame cache
 └── pinescript/
-    ├── nse_anomaly_donchian.pine    <- TradingView Pine Script v5 Strategy for NSE equities
+    ├── nse_anomaly_donchian.pine    <- TradingView Pine Script v5 Strategy for NSE equities & Nifty options
     └── spx_anomaly_donchian.pine    <- TradingView Pine Script v5 Strategy for SPX / SPY / US markets
 ```
 
 ---
 
+## Assumptions & Limitations
+
+1. **Data Feed Latency (`yfinance`)**: The Python scanner uses batched HTTP polling via Yahoo Finance (`15m`, `1h`, `1d` bars), which is designed for bar-close screening rather than sub-second tick or order-book surveillance. For tick-level alerts, use the included TradingView Pine Script v5 strategies or swap `data_sources/equities.py` for a broker WebSocket feed.
+2. **Survivorship Bias**: Universe lists (`EQUITY_L.csv`, `ind_nifty500list.csv`, and S&P 500 constituents) reflect current index/exchange membership and do not include historically delisted securities.
+3. **Single-Ticker Sample Size**: A strict dual-threshold volume + 20-bar Donchian breakout filter fires infrequently on any single stock (typically 1–5 trades per year on daily bars). Per-ticker backtest numbers shown in the GUI are descriptive context for that instrument rather than a standalone statistical proof of alpha.
+4. **Transaction Costs & Circuit Limits**: The Python backtester deducts `0.25%` round-trip costs (approximating NSE delivery STT of `0.1%` per side plus brokerage/GST/stamp duty) and `0.10 × ATR` stop-fill slippage, and defaults to a `₹1 Cr` minimum median daily turnover filter. Illiquid micro-caps subject to NSE upper/lower price circuits (`ASM`/`GSM` segments) can experience larger fill slippage in live trading.
+
+---
+
 ## Disclaimer
 
-Built for **educational and quantitative research purposes only**. Statistical volume anomalies and Donchian breakouts represent quantitative filtering rules and historical backtest simulations — they do not constitute financial advice. Always account for live market liquidity, circuit limits, and execution slippage.
+Built for **educational and quantitative research purposes only**. Statistical volume anomalies and Donchian breakouts represent quantitative filtering rules and historical backtest simulations — they do not constitute financial advice.

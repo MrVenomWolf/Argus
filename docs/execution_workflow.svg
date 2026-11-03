@@ -11,44 +11,44 @@
   <rect x="0" y="0" width="1060" height="320" fill="#121212"/>
 
   <text x="530" y="34" text-anchor="middle" fill="#ffffff" font-size="18" font-weight="700">
-    Live Market Execution Workflow — Catching Breakouts with Zero Slippage
+    Discretionary Execution Workflow — Pre-Breakout Screening &amp; Risk Management
   </text>
 
   <!-- Box 1: Scanner Detects Pre-Breakout Accumulation -->
   <rect x="28" y="65" width="300" height="195" rx="8" fill="#1b1b1f" stroke="#40c4ff" stroke-width="2"/>
   <text x="178" y="92" text-anchor="middle" fill="#40c4ff" font-size="13.5" font-weight="700">Stage 1: Pre-Breakout Accumulation</text>
   <text x="178" y="114" text-anchor="middle" fill="#ffffff" font-size="11" font-family="Consolas, monospace">Signal: BULLISH ACCUM</text>
-  <text x="178" y="138" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Volume already cleared RVOL &gt;= 2.0x</text>
-  <text x="178" y="156" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• max(Z_log, Z_mad) &gt;= 2.5σ</text>
-  <text x="178" y="174" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Price pressing just below Donchian High</text>
-  <text x="178" y="198" text-anchor="middle" fill="#9cdcfe" font-size="10.5" font-family="Consolas, monospace">Known Ceiling: Upper_t = max(H_{t-20:t-1})</text>
-  <text x="178" y="236" text-anchor="middle" fill="#aaaaaa" font-size="10">Institutional demand detected before breakout</text>
+  <text x="178" y="138" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Volume cleared RVOL &gt;= 2.0x</text>
+  <text x="178" y="156" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Calibrated Log-Z / Log-MAD &gt;= 2.5σ</text>
+  <text x="178" y="174" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Price trading in upper half of Donchian box</text>
+  <text x="178" y="198" text-anchor="middle" fill="#9cdcfe" font-size="10.5" font-family="Consolas, monospace">Resistance: Upper_t = max(H_{t-20:t-1})</text>
+  <text x="178" y="236" text-anchor="middle" fill="#aaaaaa" font-size="10">Elevated participation approaching 20-bar high</text>
 
   <line x1="328" y1="162" x2="375" y2="162" stroke="#40c4ff" stroke-width="2" marker-end="url(#arrB)"/>
 
-  <!-- Box 2: Resting Stop-Limit Order on Exchange -->
+  <!-- Box 2: Resting Stop-Limit Order on Broker -->
   <rect x="380" y="65" width="300" height="195" rx="8" fill="#1b1b1f" stroke="#ffab40" stroke-width="2"/>
-  <text x="530" y="92" text-anchor="middle" fill="#ffab40" font-size="13.5" font-weight="700">Stage 2: Zero-Latency Resting Order</text>
+  <text x="530" y="92" text-anchor="middle" fill="#ffab40" font-size="13.5" font-weight="700">Stage 2: Broker Stop-Limit Entry</text>
   <text x="530" y="114" text-anchor="middle" fill="#ffffff" font-size="11" font-family="Consolas, monospace">Order: Buy Stop-Limit (SL Buy)</text>
   <text x="530" y="138" text-anchor="middle" fill="#e1e1e1" font-size="10.5" font-family="Consolas, monospace">Trigger = DonchianUpper + 1 tick</text>
-  <text x="530" y="156" text-anchor="middle" fill="#e1e1e1" font-size="10.5" font-family="Consolas, monospace">Limit   = Trigger + 0.15% buffer</text>
-  <text x="530" y="180" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Sits directly on NSE / US Exchange server</text>
-  <text x="530" y="198" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• If price rejects ceiling → 0 fill, 0 loss</text>
-  <text x="530" y="236" text-anchor="middle" fill="#00e676" font-size="10">Fills in microseconds on 1-second breakout spike</text>
+  <text x="530" y="156" text-anchor="middle" fill="#e1e1e1" font-size="10.5" font-family="Consolas, monospace">Limit   = Trigger + slippage cap</text>
+  <text x="530" y="180" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Placed manually or via broker API</text>
+  <text x="530" y="198" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• If price rejects resistance → order stays unfilled</text>
+  <text x="530" y="236" text-anchor="middle" fill="#00e676" font-size="10">Or enter on Next-Bar Open after confirmed close</text>
 
   <line x1="680" y1="162" x2="727" y2="162" stroke="#00e676" stroke-width="2" marker-end="url(#arrG)"/>
 
   <!-- Box 3: Confirmed Breakout & ATR Risk Trail -->
   <rect x="732" y="65" width="300" height="195" rx="8" fill="#12261b" stroke="#00e676" stroke-width="2"/>
-  <text x="882" y="92" text-anchor="middle" fill="#00e676" font-size="13.5" font-weight="700">Stage 3: Breakout &amp; Dynamic Trail</text>
+  <text x="882" y="92" text-anchor="middle" fill="#00e676" font-size="13.5" font-weight="700">Stage 3: 1% Risk Sizing &amp; ATR Trail</text>
   <text x="882" y="114" text-anchor="middle" fill="#00e676" font-size="11" font-family="Consolas, monospace">Signal: LONG BREAKOUT (CLV &gt;= 65%)</text>
   <text x="882" y="138" text-anchor="middle" fill="#ff5252" font-size="10.5" font-family="Consolas, monospace">Hard Stop  = Entry - 2.0 * ATR(14)</text>
-  <text x="882" y="156" text-anchor="middle" fill="#00e676" font-size="10.5" font-family="Consolas, monospace">2R Target  = Entry + 4.0 * ATR(14)</text>
+  <text x="882" y="156" text-anchor="middle" fill="#00e676" font-size="10.5" font-family="Consolas, monospace">Target     = Entry + 4.0 * ATR(14)</text>
   <text x="882" y="176" text-anchor="middle" fill="#ffab40" font-size="10.5" font-family="Consolas, monospace">Trail Stop = max(DonMid, High - 2.5*ATR)</text>
-  <text x="882" y="202" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Cuts false breakouts at -1R</text>
-  <text x="882" y="236" text-anchor="middle" fill="#9cdcfe" font-size="10">Captures asymmetric +3R to +6R momentum trends</text>
+  <text x="882" y="202" text-anchor="middle" fill="#e1e1e1" font-size="10.5">• Position sized to 1% equity risk / stop distance</text>
+  <text x="882" y="236" text-anchor="middle" fill="#9cdcfe" font-size="10">Evaluated with 0.25% NSE cost &amp; 0.1*ATR stop slippage</text>
 
   <text x="530" y="296" text-anchor="middle" fill="#666666" font-size="11">
-    Works across NSE Equities (`ALL_NSE`, `NIFTY_500`, `NIFTY_200`) and S&amp;P 500 (`SPX_500` + TradingView Pine Script v5)
+    Supports NSE Equities (`ALL_NSE`, `NIFTY_500`, `NIFTY_200`) and S&amp;P 500 (`SPX_500` + TradingView Pine Script v5)
   </text>
 </svg>
