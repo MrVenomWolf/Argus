@@ -146,13 +146,17 @@ if strategy.position_size == 0
 else if strategy.position_size > 0
     highestClose := math.max(nz(highestClose, close), close)
     float chandelierStop = highestClose - (atrTrailMult * atrVal)
-    activeStop := math.max(nz(activeStop, chandelierStop), math.max(donMid, chandelierStop))
+    activeStop := math.max(nz(activeStop, chandelierStop), chandelierStop)
     strategy.exit("Long Exit", from_entry="SPX Call / Long", stop=activeStop, limit=activeTarget, alert_message="SPX LONG EXIT")
+    if barstate.isconfirmed and close < donMid
+        strategy.close("SPX Call / Long", comment="Close < DonMid", alert_message="SPX LONG MID EXIT")
 else if strategy.position_size < 0
     lowestClose := math.min(nz(lowestClose, close), close)
     float chandelierStop = lowestClose + (atrTrailMult * atrVal)
-    activeStop := math.min(nz(activeStop, chandelierStop), math.min(donMid, chandelierStop))
+    activeStop := math.min(nz(activeStop, chandelierStop), chandelierStop)
     strategy.exit("Short Exit", from_entry="SPX Put / Short", stop=activeStop, limit=activeTarget, alert_message="SPX SHORT EXIT")
+    if barstate.isconfirmed and close > donMid
+        strategy.close("SPX Put / Short", comment="Close > DonMid", alert_message="SPX SHORT MID EXIT")
 
 // ============================================================================
 // 6. VISUAL PLOTS (CLEAN STATUS LINE WITH `display=display.pane`) & LIVE HUD

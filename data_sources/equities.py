@@ -53,6 +53,7 @@ def _df_to_datapoints(ticker: str, df: pd.DataFrame) -> List[DataPoint]:
         return []
 
     clean_df = df[cols].dropna(subset=["Close", "Volume"]).copy()
+    clean_df = clean_df[~clean_df.index.duplicated(keep="last")].sort_index()
     if clean_df.empty:
         return []
 
@@ -62,8 +63,14 @@ def _df_to_datapoints(ticker: str, df: pd.DataFrame) -> List[DataPoint]:
     points: List[DataPoint] = []
     for row in clean_df.itertuples():
         c, v = float(row.Close), float(row.Volume)
-        if pd.isna(c) or pd.isna(v) or c <= 0:
+        if pd.isna(c) or pd.isna(v) or c <= 0 or v < 0:
             continue
+        o = float(row.Open) if not pd.isna(row.Open) and row.Open > 0 else c
+        raw_h = float(row.High) if not pd.isna(row.High) and row.High > 0 else c
+        raw_l = float(row.Low) if not pd.isna(row.Low) and row.Low > 0 else c
+        h = max(o, raw_h, raw_l, c)
+        l = min(o, raw_h, raw_l, c)
+
         ts = row.Index.to_pydatetime() if hasattr(row.Index, "to_pydatetime") else row.Index
         if getattr(ts, "tzinfo", None) is None:
             ts = ts.replace(tzinfo=timezone.utc)
@@ -74,12 +81,7 @@ def _df_to_datapoints(ticker: str, df: pd.DataFrame) -> List[DataPoint]:
                 timestamp=ts,
                 value=v,
                 value_label="Volume (shares)",
-                raw={
-                    "open": float(row.Open) if not pd.isna(row.Open) else c,
-                    "high": float(row.High) if not pd.isna(row.High) else c,
-                    "low": float(row.Low) if not pd.isna(row.Low) else c,
-                    "close": c,
-                },
+                raw={"open": o, "high": h, "low": l, "close": c},
             )
         )
     return points

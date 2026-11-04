@@ -128,17 +128,38 @@ def student_t_one_sided_pvalue(t_stat: float, df: int = 19) -> float:
     return 0.5 * math.erfc(z_eq / math.sqrt(2.0))
 
 
-def apply_benjamini_hochberg(anomalies: List[Anomaly], total_tested: int) -> List[Anomaly]:
-    """Computes Benjamini-Hochberg (1995) False Discovery Rate q-values across `total_tested` symbols."""
+def apply_benjamini_hochberg(
+    anomalies: List[Anomaly],
+    total_tested: int,
+    all_p_values: Optional[List[float]] = None,
+) -> List[Anomaly]:
+    """
+    Computes Benjamini-Hochberg (1995) False Discovery Rate q-values.
+    When `all_p_values` (from the complete tested universe of M symbols) is provided,
+    ranks are evaluated over the full family of M p-values before assigning q-values.
+    """
     if not anomalies:
         return anomalies
+    if all_p_values and len(all_p_values) >= len(anomalies):
+        m = len(all_p_values)
+        sorted_p = np.sort(np.asarray(all_p_values, dtype=float))
+        ranks = np.arange(1, m + 1, dtype=float)
+        raw_q = (sorted_p * m) / ranks
+        bh_q = np.minimum.accumulate(raw_q[::-1])[::-1]
+        bh_q = np.clip(bh_q, 0.0, 1.0)
+        for a in anomalies:
+            idx = int(np.searchsorted(sorted_p, a.p_value, side="right")) - 1
+            idx = max(0, min(m - 1, idx))
+            a.fdr_q = float(bh_q[idx])
+        return anomalies
+
     m = max(total_tested, len(anomalies))
     ordered = sorted(anomalies, key=lambda a: a.p_value)
     running_min = 1.0
     for rank in range(len(ordered), 0, -1):
         a = ordered[rank - 1]
         running_min = min(running_min, (a.p_value * m) / rank)
-        a.fdr_q = running_min
+        a.fdr_q = min(1.0, running_min)
     return anomalies
 
 
@@ -307,7 +328,11 @@ def find_anomalies(
     closes, highs, lows, opens = ohlc.T
     close_t, high_t, low_t, open_t = closes[-1], highs[-1], lows[-1], opens[-1]
 
-    turnover_cr = (baseline_med * close_t) / 1e7 if close_t > 0 else 0.0
+    prior_closes = closes[-(window + 1) : -1]
+    if len(prior_closes) == len(hist_vols) and np.all(prior_closes > 0):
+        turnover_cr = float(np.median(hist_vols * prior_closes)) / 1e7
+    else:
+        turnover_cr = (baseline_med * close_t) / 1e7 if close_t > 0 else 0.0
     if interval == "1d" and min_turnover_cr > 0 and close_t > 0 and turnover_cr < min_turnover_cr:
         return []
 
@@ -353,6 +378,25 @@ def find_anomalies(
     ]
 
 
+def compute_symbol_pvalue(
+    points: List[DataPoint],
+    window: int = None,
+    interval: str = "1d",
+) -> Optional[float]:
+    """Computes the predictive Student-t p-value for a symbol (used for full-family BH FDR)."""
+    window = window or config.BASELINE_WINDOW
+    if not points or len(points) < window + 1:
+        return None
+    points = sorted(points, key=lambda p: p.timestamp)
+    hist_vols, eff_vol, _ = _select_baseline_history(points, window=window, interval=interval)
+    _, _, z_score, _ = calculate_robust_metrics(hist_vols, eff_vol)
+    n_hist = len(hist_vols)
+    if n_hist < 5:
+        return None
+    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_hist)
+    return student_t_one_sided_pvalue(t_stat, df=max(4, n_hist - 1))
+
+
 def backtest_donchian_volume(
     df: pd.DataFrame,
     symbol: str = "",
@@ -361,6 +405,7 @@ def backtest_donchian_volume(
     min_rvol: float = None,
     min_z_score: float = None,
     cost_pct: float = None,
+    use_target: bool = False,
 ) -> Optional[BacktestResult]:
     if df is None or df.empty:
         return None
@@ -382,9 +427,23 @@ def backtest_donchian_volume(
     atr = compute_wilder_atr(highs, lows, closes, period=config.ATR_PERIOD)
     d_upper, _, d_mid = compute_donchian_channels(highs, lows, window=donchian_window)
 
+    # Detect intraday index for same-slot baseline parity with live scanner
+    tz = IST if symbol.endswith(".NS") else NY_TZ
+    slots: Optional[List[Tuple[int, int]]] = None
+    if hasattr(df.index, "tz") or isinstance(df.index, pd.DatetimeIndex):
+        sample_slots = [
+            _to_exchange_hm(ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts, tz)
+            for ts in df.index[: min(len(df), 30)]
+        ]
+        if len(set(sample_slots)) > 1:
+            slots = [
+                _to_exchange_hm(ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts, tz)
+                for ts in df.index
+            ]
+
     def _simulate(require_vol: bool):
         in_pos, pending_entry, pending_exit = False, False, False
-        entry, risk, stop, hi_close, pos_weight = 0.0, 0.0, 0.0, 0.0, 1.0
+        entry, risk, stop, target, hi_close, pos_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
         r_mults, rets = [], []
         eq, peak, max_dd = 1.0, 1.0, 0.0
         slip_frac = getattr(config, "STOP_SLIPPAGE_ATR_FRAC", 0.10)
@@ -401,20 +460,25 @@ def backtest_donchian_volume(
                 entry = o if (np.isfinite(o) and o > 0) else c
                 risk = max(entry * 0.01, config.ATR_STOP_MULT * atr[i - 1])
                 stop = entry - risk
+                target = entry + config.ATR_TARGET_MULT * atr[i - 1]
                 hi_close = entry
                 stop_dist_frac = risk / entry
                 pos_weight = min(1.0, risk_pct / stop_dist_frac) if stop_dist_frac > 1e-9 else 1.0
                 in_pos = True
 
             if in_pos:
+                # Conservative precedence: check hard/trailing stop BEFORE profit target on the same bar
                 hit_stop = l <= stop
+                hit_target = use_target and (not hit_stop) and (h >= target)
                 is_last = i == len(closes) - 1
-                if pending_exit or hit_stop or is_last:
+                if pending_exit or hit_stop or hit_target or is_last:
                     if pending_exit:
                         exit_px = o if (np.isfinite(o) and o > 0) else c
                     elif hit_stop:
                         raw_exit = min(o, stop) if o < stop else stop
                         exit_px = max(0.01, raw_exit - slip_frac * atr[i])
+                    elif hit_target:
+                        exit_px = max(o, target) if o > target else target
                     else:
                         exit_px = c
                     net_ret = ((exit_px - entry) / entry) - (cost_pct / 100.0)
@@ -428,7 +492,7 @@ def backtest_donchian_volume(
                     in_pos, pending_exit = False, False
                 else:
                     hi_close = max(hi_close, c)
-                    stop = max(stop, d_mid[i], hi_close - 2.5 * atr[i])
+                    stop = max(stop, hi_close - 2.5 * atr[i])
                     if c < d_mid[i]:
                         pending_exit = True
                 continue
@@ -439,7 +503,12 @@ def backtest_donchian_volume(
                 clv = (c - l) / (h - l) if (h - l) > 1e-9 else 0.5
                 if clv < config.MIN_CLOSE_STRENGTH:
                     continue
-                _, rvol_i, z_i, mod_z_i = calculate_robust_metrics(vols[i - window : i], v)
+                if slots is not None:
+                    slot_vols = [vols[j] for j in range(i) if slots[j] == slots[i] and vols[j] > 0]
+                    hist_v = np.array(slot_vols[-window:], dtype=float) if len(slot_vols) >= 5 else vols[i - window : i]
+                else:
+                    hist_v = vols[i - window : i]
+                _, rvol_i, z_i, mod_z_i = calculate_robust_metrics(hist_v, v)
                 eff_z_i = mod_z_i if (mod_z_i > z_i * 1.40 and z_i > 0.5) else z_i
                 if rvol_i < min_rvol or eff_z_i < min_z_score:
                     continue
