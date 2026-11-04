@@ -108,9 +108,21 @@ class TestMathematicalEngine(unittest.TestCase):
         dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
         a1 = anomaly_engine.Anomaly(DataPoint("eq", "A.NS", dt, 100), 30, 3.3, 4.0, 4.0, p_value=0.0005)
         a2 = anomaly_engine.Anomaly(DataPoint("eq", "B.NS", dt, 100), 30, 2.5, 2.6, 2.6, p_value=0.0080)
+        self.assertIsNone(a1.fdr_q)
         apply_benjamini_hochberg([a2, a1], total_tested=100)
         self.assertAlmostEqual(a1.fdr_q, 0.05, places=4)
         self.assertAlmostEqual(a2.fdr_q, 0.40, places=4)
+
+        # Verify prediction-error scaled t = z_log / sqrt(1 + 1/n) p-value uniformity on noise
+        rng = np.random.default_rng(99)
+        samples = rng.lognormal(mean=14.0, sigma=0.3, size=(2000, 21))
+        p_vals = []
+        for row in samples:
+            _, _, z_log, _ = calculate_robust_metrics(row[:-1], row[-1])
+            t_stat = z_log / np.sqrt(1.0 + 1.0 / 20.0)
+            p_vals.append(student_t_one_sided_pvalue(float(t_stat), df=19))
+        frac_01 = float(np.mean(np.array(p_vals) <= 0.01))
+        self.assertTrue(0.005 <= frac_01 <= 0.016, f"Expected ~0.01 tail rate, got {frac_01:.4f}")
 
     def test_shifted_donchian_channel_excludes_current_bar(self):
         highs = np.array([100.0, 102.0, 105.0, 103.0, 104.0, 120.0])

@@ -115,8 +115,9 @@ float barRange = high - low
 float clv      = barRange > 1e-9 ? (close - low) / barRange : 0.5
 float atrVal   = ta.atr(atrLen)
 
-bool vwapBullOk = not useVwapFilter or (close >= sessionVwap)
-bool vwapBearOk = not useVwapFilter or (close <= sessionVwap)
+bool vwapActive = useVwapFilter and timeframe.isintraday
+bool vwapBullOk = not vwapActive or (close >= sessionVwap)
+bool vwapBearOk = not vwapActive or (close <= sessionVwap)
 
 bool longBreakout   = isVolAnomaly and (close > donUpper) and (clv >= minClv) and (close >= open) and vwapBullOk
 bool shortBreakdown = isVolAnomaly and (close < donLower) and (clv <= (1.0 - minClv)) and (close <= open) and vwapBearOk

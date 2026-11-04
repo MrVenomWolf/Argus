@@ -51,7 +51,7 @@ class Anomaly:
     turnover_cr: float = 0.0
     is_live_projected: bool = False
     p_value: float = 1.0
-    fdr_q: float = 1.0
+    fdr_q: Optional[float] = None
 
     @property
     def currency(self) -> str:
@@ -288,7 +288,9 @@ def find_anomalies(
     if eff_z < min_z_score or rvol < min_rvol:
         return []
 
-    p_val = student_t_one_sided_pvalue(eff_z, df=max(4, len(hist_vols) - 1))
+    n_hist = len(hist_vols)
+    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_hist) if n_hist > 0 else 0.0
+    p_val = student_t_one_sided_pvalue(t_stat, df=max(4, n_hist - 1))
 
     ohlc = np.array(
         [
@@ -346,7 +348,7 @@ def find_anomalies(
             turnover_cr=turnover_cr,
             is_live_projected=is_proj,
             p_value=p_val,
-            fdr_q=p_val,
+            fdr_q=None,
         )
     ]
 
@@ -381,7 +383,7 @@ def backtest_donchian_volume(
     d_upper, _, d_mid = compute_donchian_channels(highs, lows, window=donchian_window)
 
     def _simulate(require_vol: bool):
-        in_pos, pending_entry = False, False
+        in_pos, pending_entry, pending_exit = False, False, False
         entry, risk, stop, hi_close, pos_weight = 0.0, 0.0, 0.0, 0.0, 1.0
         r_mults, rets = [], []
         eq, peak, max_dd = 1.0, 1.0, 0.0
@@ -395,7 +397,7 @@ def backtest_donchian_volume(
 
             # Fill pending signal from bar i-1 at bar i's Open (no same-bar close bias)
             if pending_entry and not in_pos:
-                pending_entry = False
+                pending_entry, pending_exit = False, False
                 entry = o if (np.isfinite(o) and o > 0) else c
                 risk = max(entry * 0.01, config.ATR_STOP_MULT * atr[i - 1])
                 stop = entry - risk
@@ -406,9 +408,15 @@ def backtest_donchian_volume(
 
             if in_pos:
                 hit_stop = l <= stop
-                if hit_stop or c < d_mid[i] or i == len(closes) - 1:
-                    raw_exit = (min(o, stop) if o < stop else stop) if hit_stop else c
-                    exit_px = max(0.01, raw_exit - (slip_frac * atr[i] if hit_stop else 0.0))
+                is_last = i == len(closes) - 1
+                if pending_exit or hit_stop or is_last:
+                    if pending_exit:
+                        exit_px = o if (np.isfinite(o) and o > 0) else c
+                    elif hit_stop:
+                        raw_exit = min(o, stop) if o < stop else stop
+                        exit_px = max(0.01, raw_exit - slip_frac * atr[i])
+                    else:
+                        exit_px = c
                     net_ret = ((exit_px - entry) / entry) - (cost_pct / 100.0)
                     r_mult = (net_ret * entry) / risk if risk > 1e-9 else 0.0
                     sized_ret = pos_weight * net_ret
@@ -417,10 +425,12 @@ def backtest_donchian_volume(
                     eq *= 1.0 + sized_ret
                     peak = max(peak, eq)
                     max_dd = max(max_dd, (peak - eq) / peak)
-                    in_pos = False
+                    in_pos, pending_exit = False, False
                 else:
                     hi_close = max(hi_close, c)
                     stop = max(stop, d_mid[i], hi_close - 2.5 * atr[i])
+                    if c < d_mid[i]:
+                        pending_exit = True
                 continue
 
             if i >= len(closes) - 1 or c <= d_upper[i] or c < o:

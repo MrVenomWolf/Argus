@@ -272,13 +272,16 @@ class DashboardApp(tk.Tk):
             self.anomalies_map[iid] = a
 
         bo_total = sum(1 for a in self.all_last_anomalies if a.is_actionable_breakout)
+        stats = equities.LAST_SCAN_STATS
+        cov_str = f"{stats['fetched']}/{stats['requested']} fetched" if stats.get("requested") else ""
         self.lbl_status.config(
-            text=f"Scan complete: {len(displayed)} shown ({len(self.all_last_anomalies)} anomalies, {bo_total} Donchian Breakouts).",
+            text=f"Scan complete ({cov_str}): {len(displayed)} shown ({len(self.all_last_anomalies)} anomalies, {bo_total} Donchian Breakouts).",
             foreground="#00e676" if displayed else "#ffab40",
         )
         if children := self.tree.get_children():
             self.tree.selection_set(children[0])
             self.tree.focus(children[0])
+            self.on_stock_select()
 
     def on_stock_select(self, _event=None):
         if not (sel := self.tree.selection()) or not (anomaly := self.anomalies_map.get(sel[0])):

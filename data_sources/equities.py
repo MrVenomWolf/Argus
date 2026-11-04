@@ -19,6 +19,7 @@ warnings.filterwarnings("ignore", message=".*inplace keyword.*")
 
 _CACHE_LOCK = threading.Lock()
 DATAFRAME_CACHE: Dict[str, pd.DataFrame] = {}
+LAST_SCAN_STATS: Dict[str, int] = {"requested": 0, "fetched": 0, "skipped": 0, "failed": 0}
 
 DEFAULT_PERIOD_BY_INTERVAL = {
     "5m": "5d",
@@ -109,6 +110,7 @@ def fetch_equities_batch(
     resolved_period = period or DEFAULT_PERIOD_BY_INTERVAL.get(interval, "1y")
     results: Dict[str, List[DataPoint]] = {}
     total = len(tickers)
+    failed_count = 0
 
     for start in range(0, total, chunk_size):
         if cancel_event and cancel_event.is_set():
@@ -116,7 +118,7 @@ def fetch_equities_batch(
 
         chunk = tickers[start : start + chunk_size]
         raw_df = None
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 raw_df = yf.download(
                     tickers=chunk,
@@ -129,20 +131,28 @@ def fetch_equities_batch(
                 )
                 break
             except Exception:
-                if attempt == 0:
-                    time.sleep(1.0)
+                if attempt < 2:
+                    time.sleep(0.8 * (2 ** attempt))
 
-        if raw_df is not None and not raw_df.empty:
-            if isinstance(raw_df.columns, pd.MultiIndex):
-                available = set(raw_df.columns.get_level_values(0))
-                for t in chunk:
-                    if t in available and (pts := _df_to_datapoints(t, raw_df[t])):
-                        results[t] = pts
-            elif len(chunk) == 1:
-                if pts := _df_to_datapoints(chunk[0], raw_df):
-                    results[chunk[0]] = pts
+        if raw_df is None or raw_df.empty:
+            failed_count += len(chunk)
+        elif isinstance(raw_df.columns, pd.MultiIndex):
+            available = set(raw_df.columns.get_level_values(0))
+            for t in chunk:
+                if t in available and (pts := _df_to_datapoints(t, raw_df[t])):
+                    results[t] = pts
+        elif len(chunk) == 1:
+            if pts := _df_to_datapoints(chunk[0], raw_df):
+                results[chunk[0]] = pts
 
         if progress_callback:
             progress_callback(min(total, start + len(chunk)), total)
 
+    fetched_count = len(results)
+    LAST_SCAN_STATS.update({
+        "requested": total,
+        "fetched": fetched_count,
+        "skipped": max(0, total - fetched_count - failed_count),
+        "failed": failed_count,
+    })
     return results
