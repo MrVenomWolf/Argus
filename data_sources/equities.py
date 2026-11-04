@@ -1,13 +1,14 @@
 """
 data_sources/equities.py
 =========================
-Batched, rate-limit-resistant NSE OHLCV fetcher with in-memory DataFrame cache.
+Batched, rate-limit-resistant NSE & US OHLCV fetcher with strict OHLCV
+validation and in-memory DataFrame caching.
 """
 
 from datetime import timezone
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 import warnings
 
 import pandas as pd
@@ -19,7 +20,13 @@ warnings.filterwarnings("ignore", message=".*inplace keyword.*")
 
 _CACHE_LOCK = threading.Lock()
 DATAFRAME_CACHE: Dict[str, pd.DataFrame] = {}
-LAST_SCAN_STATS: Dict[str, int] = {"requested": 0, "fetched": 0, "skipped": 0, "failed": 0}
+LAST_SCAN_STATS: Dict[str, int] = {
+    "requested": 0,
+    "fetched": 0,
+    "skipped": 0,
+    "failed": 0,
+    "rejected_bars": 0,
+}
 
 DEFAULT_PERIOD_BY_INTERVAL = {
     "5m": "5d",
@@ -41,36 +48,42 @@ def clear_dataframe_cache() -> None:
         DATAFRAME_CACHE.clear()
 
 
-def _df_to_datapoints(ticker: str, df: pd.DataFrame) -> List[DataPoint]:
+def _df_to_datapoints(ticker: str, df: pd.DataFrame) -> Tuple[List[DataPoint], int]:
+    """
+    Validates OHLCV rows, rejecting any bar with missing/non-positive prices,
+    negative volume, or inverted OHLC relationships (High < Low, High < max(O,C),
+    or Low > min(O,C)) rather than silently repairing malformed data.
+    Returns (valid_points, rejected_bar_count).
+    """
     if df is None or df.empty:
-        return []
+        return [], 0
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = df.columns.get_level_values(0)
 
     cols = ["Open", "High", "Low", "Close", "Volume"]
     if not set(cols).issubset(df.columns):
-        return []
+        return [], 0
 
-    clean_df = df[cols].dropna(subset=["Close", "Volume"]).copy()
-    clean_df = clean_df[~clean_df.index.duplicated(keep="last")].sort_index()
-    if clean_df.empty:
-        return []
+    sub = df[cols].dropna(subset=["Close", "Volume"]).copy()
+    raw_len = len(sub)
+    sub = sub[~sub.index.duplicated(keep="last")].sort_index()
 
-    with _CACHE_LOCK:
-        DATAFRAME_CACHE[ticker] = clean_df
-
+    valid_rows = []
     points: List[DataPoint] = []
-    for row in clean_df.itertuples():
-        c, v = float(row.Close), float(row.Volume)
-        if pd.isna(c) or pd.isna(v) or c <= 0 or v < 0:
-            continue
-        o = float(row.Open) if not pd.isna(row.Open) and row.Open > 0 else c
-        raw_h = float(row.High) if not pd.isna(row.High) and row.High > 0 else c
-        raw_l = float(row.Low) if not pd.isna(row.Low) and row.Low > 0 else c
-        h = max(o, raw_h, raw_l, c)
-        l = min(o, raw_h, raw_l, c)
+    rejected = raw_len - len(sub)
 
+    for row in sub.itertuples():
+        o, h, l, c, v = row.Open, row.High, row.Low, row.Close, row.Volume
+        if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c) or pd.isna(v):
+            rejected += 1
+            continue
+        o, h, l, c, v = float(o), float(h), float(l), float(c), float(v)
+        if min(o, h, l, c) <= 0 or v < 0 or h < max(o, c, l) or l > min(o, c, h):
+            rejected += 1
+            continue
+
+        valid_rows.append(row.Index)
         ts = row.Index.to_pydatetime() if hasattr(row.Index, "to_pydatetime") else row.Index
         if getattr(ts, "tzinfo", None) is None:
             ts = ts.replace(tzinfo=timezone.utc)
@@ -84,7 +97,13 @@ def _df_to_datapoints(ticker: str, df: pd.DataFrame) -> List[DataPoint]:
                 raw={"open": o, "high": h, "low": l, "close": c},
             )
         )
-    return points
+
+    if points:
+        clean_df = sub.loc[valid_rows].copy()
+        with _CACHE_LOCK:
+            DATAFRAME_CACHE[ticker] = clean_df
+
+    return points, rejected
 
 
 def fetch_equity_volume(
@@ -96,7 +115,8 @@ def fetch_equity_volume(
         period=period or DEFAULT_PERIOD_BY_INTERVAL.get(interval, "1y"),
         interval=interval,
     )
-    return _df_to_datapoints(ticker, df)
+    pts, _ = _df_to_datapoints(ticker, df)
+    return pts
 
 
 def fetch_equities_batch(
@@ -113,6 +133,7 @@ def fetch_equities_batch(
     results: Dict[str, List[DataPoint]] = {}
     total = len(tickers)
     failed_count = 0
+    rejected_bars_total = 0
 
     for start in range(0, total, chunk_size):
         if cancel_event and cancel_event.is_set():
@@ -141,10 +162,15 @@ def fetch_equities_batch(
         elif isinstance(raw_df.columns, pd.MultiIndex):
             available = set(raw_df.columns.get_level_values(0))
             for t in chunk:
-                if t in available and (pts := _df_to_datapoints(t, raw_df[t])):
-                    results[t] = pts
+                if t in available:
+                    pts, rej = _df_to_datapoints(t, raw_df[t])
+                    rejected_bars_total += rej
+                    if pts:
+                        results[t] = pts
         elif len(chunk) == 1:
-            if pts := _df_to_datapoints(chunk[0], raw_df):
+            pts, rej = _df_to_datapoints(chunk[0], raw_df)
+            rejected_bars_total += rej
+            if pts:
                 results[chunk[0]] = pts
 
         if progress_callback:
@@ -156,5 +182,6 @@ def fetch_equities_batch(
         "fetched": fetched_count,
         "skipped": max(0, total - fetched_count - failed_count),
         "failed": failed_count,
+        "rejected_bars": rejected_bars_total,
     })
     return results

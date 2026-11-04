@@ -273,7 +273,9 @@ class DashboardApp(tk.Tk):
 
         bo_total = sum(1 for a in self.all_last_anomalies if a.is_actionable_breakout)
         stats = equities.LAST_SCAN_STATS
-        cov_str = f"{stats['fetched']}/{stats['requested']} fetched" if stats.get("requested") else ""
+        rej = stats.get("rejected_bars", 0)
+        rej_str = f", {rej} invalid bars rejected" if rej else ""
+        cov_str = f"{stats['fetched']}/{stats['requested']} fetched{rej_str}" if stats.get("requested") else ""
         self.lbl_status.config(
             text=f"Scan complete ({cov_str}): {len(displayed)} shown ({len(self.all_last_anomalies)} anomalies, {bo_total} Donchian Breakouts).",
             foreground="#00e676" if displayed else "#ffab40",
@@ -349,7 +351,7 @@ class DashboardApp(tk.Tk):
         )
 
         bt_line = (
-            f"BACKTEST ({bt.total_bars} bars, 0.15% cost) -> Vol+Donchian: {bt.trades} trades | "
+            f"LONG-ONLY BACKTEST ({bt.total_bars} bars, 0.25% cost) -> Vol+Donchian: {bt.trades} trades | "
             f"Win: {bt.win_rate_pct:.0f}% | PF: {bt.profit_factor:.2f} | Avg: {bt.avg_r_multiple:+.2f}R | "
             f"Net: {bt.net_return_pct:+.1f}% (Raw Donchian: {bt.unfiltered_net_return_pct:+.1f}%)"
             if bt
