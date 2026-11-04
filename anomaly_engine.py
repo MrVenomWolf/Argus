@@ -313,17 +313,17 @@ def compute_symbol_pvalue(
     interval: str = "1d",
 ) -> Optional[float]:
     """Computes the parametric predictive Student-t p-value for a symbol."""
-    window = window or config.BASELINE_WINDOW
+    window = window if (window is not None and window > 0) else config.BASELINE_WINDOW
     if not points or len(points) < window + 1:
         return None
     points = sorted(points, key=lambda p: p.timestamp)
     hist_vols, eff_vol, _ = _select_baseline_history(points, window=window, interval=interval)
-    _, _, z_score, _ = calculate_robust_metrics(hist_vols, eff_vol)
-    n_hist = len(hist_vols)
-    if n_hist < 5:
+    n_valid = int(np.sum(np.isfinite(hist_vols) & (hist_vols > 0)))
+    if n_valid < 5:
         return None
-    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_hist)
-    return student_t_one_sided_pvalue(t_stat, df=max(4, n_hist - 1))
+    _, _, z_score, _ = calculate_robust_metrics(hist_vols, eff_vol)
+    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_valid)
+    return student_t_one_sided_pvalue(t_stat, df=max(4, n_valid - 1))
 
 
 def find_anomalies(
@@ -336,13 +336,15 @@ def find_anomalies(
     only_breakouts: bool = False,
     min_turnover_cr: float = None,
 ) -> List[Anomaly]:
-    window = window or config.BASELINE_WINDOW
-    donchian_window = donchian_window or config.DONCHIAN_WINDOW
+    window = window if (window is not None and window > 0) else config.BASELINE_WINDOW
+    donchian_window = (
+        donchian_window if (donchian_window is not None and donchian_window > 0) else config.DONCHIAN_WINDOW
+    )
     min_rvol = min_rvol if min_rvol is not None else config.MIN_RVOL
     min_z_score = min_z_score if min_z_score is not None else config.MIN_Z_SCORE
     min_turnover_cr = min_turnover_cr if min_turnover_cr is not None else config.MIN_MEDIAN_TURNOVER_CR
 
-    if not points or len(points) < window + 1:
+    if not points or len(points) < max(window, donchian_window) + 1:
         return []
 
     points = sorted(points, key=lambda p: p.timestamp)
@@ -377,9 +379,9 @@ def find_anomalies(
     if not passed:
         return []
 
-    n_hist = len(hist_vols)
-    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_hist) if n_hist > 0 else 0.0
-    p_val = student_t_one_sided_pvalue(t_stat, df=max(4, n_hist - 1))
+    n_valid = int(np.sum(np.isfinite(hist_vols) & (hist_vols > 0)))
+    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_valid) if n_valid > 0 else 0.0
+    p_val = student_t_one_sided_pvalue(t_stat, df=max(4, n_valid - 1))
 
     d_upper = float(np.max(highs[-(donchian_window + 1) : -1]))
     d_lower = float(np.min(lows[-(donchian_window + 1) : -1]))
@@ -394,7 +396,7 @@ def find_anomalies(
     if only_breakouts and signal not in ("LONG BREAKOUT", "SHORT BREAKDOWN"):
         return []
 
-    direction = -1.0 if signal == "SHORT BREAKDOWN" else 1.0
+    direction = -1.0 if signal in ("SHORT BREAKDOWN", "BEARISH DISTRIB") else 1.0
     stop_loss = max(0.0, close_t - direction * config.ATR_STOP_MULT * atr_val)
     target_price = max(0.0, close_t + direction * config.ATR_TARGET_MULT * atr_val)
 
@@ -504,6 +506,7 @@ def backtest_donchian_volume(
                 in_pos = True
 
             if in_pos:
+                prev_atr = atr[i - 1]
                 hit_stop = l <= stop
                 hit_target = use_target and (not hit_stop) and (h >= target)
                 is_last = i == len(closes) - 1
@@ -512,7 +515,7 @@ def backtest_donchian_volume(
                         exit_px = o if (np.isfinite(o) and o > 0) else c
                     elif hit_stop:
                         raw_exit = min(o, stop) if o < stop else stop
-                        exit_px = max(0.01, raw_exit - slip_frac * atr[i])
+                        exit_px = max(0.01, raw_exit - slip_frac * prev_atr)
                     elif hit_target:
                         exit_px = max(o, target) if o > target else target
                     else:
@@ -527,6 +530,12 @@ def backtest_donchian_volume(
                     max_dd = max(max_dd, (peak - eq) / peak)
                     in_pos, pending_exit = False, False
                 else:
+                    # Track marked-to-market unrealized peak and drawdown while position is open
+                    mtm_close = eq * (1.0 + pos_weight * ((c - entry) / entry))
+                    mtm_low = eq * (1.0 + pos_weight * ((l - entry) / entry))
+                    peak = max(peak, mtm_close)
+                    max_dd = max(max_dd, (peak - mtm_low) / peak, (peak - mtm_close) / peak)
+
                     hi_close = max(hi_close, c)
                     stop = max(stop, hi_close - 2.5 * atr[i])
                     if c < d_mid[i]:
@@ -570,7 +579,7 @@ def backtest_donchian_volume(
             return 0, 0.0, 0.0, 0.0, 0.0, 0.0
         wins = [r for r in rets if r > 0]
         loss_sum = sum(-r for r in rets if r <= 0)
-        pf = (sum(wins) / loss_sum) if loss_sum > 1e-9 else (9.99 if wins else 0.0)
+        pf = (sum(wins) / loss_sum) if loss_sum > 1e-9 else (float("inf") if wins else 0.0)
         return len(rets), len(wins) / len(rets) * 100.0, pf, float(np.mean(r_mults)), (eq - 1.0) * 100.0, max_dd * 100.0
 
     t, wr, pf, avg_r, net, dd = _simulate(True)

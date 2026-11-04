@@ -5,10 +5,11 @@ Non-Blocking Quantitative Dark Terminal for NSE Volume Anomaly & Donchian
 Breakout Detection.
 """
 
+import math
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -37,7 +38,14 @@ class DashboardApp(tk.Tk):
         self.all_last_anomalies: List[Anomaly] = []
         self._scan_cancel_event: Optional[threading.Event] = None
         self._is_scanning = False
+        self._was_cancelled = False
         self._chart_request_id = 0
+        self._scan_params: Tuple[float, float, int, str] = (
+            config.MIN_RVOL,
+            config.MIN_Z_SCORE,
+            config.DONCHIAN_WINDOW,
+            "1d",
+        )
 
         self._apply_dark_theme()
         self._setup_ui()
@@ -197,7 +205,9 @@ class DashboardApp(tk.Tk):
             return
 
         universe, interval = self.universe_var.get(), self.interval_var.get()
+        self._scan_params = (min_rvol, min_z, donchian_n, interval)
         self._is_scanning = True
+        self._was_cancelled = False
         self._scan_cancel_event = threading.Event()
         self.btn_run.config(text="STOP SCAN")
         self.progress["value"] = 0
@@ -236,8 +246,9 @@ class DashboardApp(tk.Tk):
         if not self.winfo_exists():
             return
         self._is_scanning = False
+        self._was_cancelled = bool(self._scan_cancel_event and self._scan_cancel_event.is_set())
         self.btn_run.config(text="RUN LIVE SCAN")
-        self.progress["value"] = 0 if error_msg else 100
+        self.progress["value"] = 0 if error_msg else (self.progress["value"] if self._was_cancelled else 100)
         if error_msg:
             self.lbl_status.config(text=f"Scan failed: {error_msg}", foreground="#ff5252")
             messagebox.showerror("Scan Error", f"Failed: {error_msg}")
@@ -276,9 +287,10 @@ class DashboardApp(tk.Tk):
         rej = stats.get("rejected_bars", 0)
         rej_str = f", {rej} invalid bars rejected" if rej else ""
         cov_str = f"{stats['fetched']}/{stats['requested']} fetched{rej_str}" if stats.get("requested") else ""
+        state_lbl = "Scan stopped — partial" if self._was_cancelled else "Scan complete"
         self.lbl_status.config(
-            text=f"Scan complete ({cov_str}): {len(displayed)} shown ({len(self.all_last_anomalies)} anomalies, {bo_total} Donchian Breakouts).",
-            foreground="#00e676" if displayed else "#ffab40",
+            text=f"{state_lbl} ({cov_str}): {len(displayed)} shown ({len(self.all_last_anomalies)} anomalies, {bo_total} Donchian Breakouts).",
+            foreground="#ffab40" if (self._was_cancelled or not displayed) else "#00e676",
         )
         if children := self.tree.get_children():
             self.tree.selection_set(children[0])
@@ -296,7 +308,7 @@ class DashboardApp(tk.Tk):
             return
 
         self.lbl_price_info.config(text=f"Loading {symbol}...", fg="#9cdcfe")
-        interval = self.interval_var.get()
+        _, _, _, interval = self._scan_params
 
         def fetch_worker():
             try:
@@ -305,8 +317,9 @@ class DashboardApp(tk.Tk):
                     self.after(0, self._prepare_and_render_symbol, req_id, symbol, df, anomaly)
                 else:
                     self.after(0, lambda: self.lbl_price_info.config(text=f"No data for {symbol}", fg="#ff5252"))
-            except Exception as e:
-                self.after(0, lambda: self.lbl_price_info.config(text=f"Error: {e}", fg="#ff5252"))
+            except Exception as exc:
+                err_msg = str(exc)
+                self.after(0, lambda msg=err_msg: self.lbl_price_info.config(text=f"Error: {msg}", fg="#ff5252"))
 
         threading.Thread(target=fetch_worker, daemon=True).start()
 
@@ -334,7 +347,7 @@ class DashboardApp(tk.Tk):
         if getattr(df.index, "tz", None) is not None:
             df.index = df.index.tz_localize(None)
 
-        donchian_n = max(5, int(self._safe_float(self.donchian_var.get(), config.DONCHIAN_WINDOW)))
+        scan_rvol, scan_z, donchian_n, scan_interval = self._scan_params
         highs, lows, vols = (
             pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float) for col in ("High", "Low", "Volume")
         )
@@ -346,14 +359,15 @@ class DashboardApp(tk.Tk):
             symbol=symbol,
             window=config.BASELINE_WINDOW,
             donchian_window=donchian_n,
-            min_rvol=self._safe_float(self.rvol_var.get(), config.MIN_RVOL),
-            min_z_score=self._safe_float(self.z_var.get(), config.MIN_Z_SCORE),
+            min_rvol=scan_rvol,
+            min_z_score=scan_z,
         )
 
+        pf_str = "INF" if (bt and math.isinf(bt.profit_factor)) else (f"{bt.profit_factor:.2f}" if bt else "0.00")
         bt_line = (
             f"LONG-ONLY BACKTEST ({bt.total_bars} bars, 0.25% cost) -> Vol+Donchian: {bt.trades} trades | "
-            f"Win: {bt.win_rate_pct:.0f}% | PF: {bt.profit_factor:.2f} | Avg: {bt.avg_r_multiple:+.2f}R | "
-            f"Net: {bt.net_return_pct:+.1f}% (Raw Donchian: {bt.unfiltered_net_return_pct:+.1f}%)"
+            f"Win: {bt.win_rate_pct:.0f}% | PF: {pf_str} | Avg: {bt.avg_r_multiple:+.2f}R | "
+            f"Net: {bt.net_return_pct:+.1f}% | MaxDD: {bt.max_drawdown_pct:.1f}% (Raw: {bt.unfiltered_net_return_pct:+.1f}%)"
             if bt
             else "Backtest: Insufficient historical bars"
         )
@@ -363,12 +377,13 @@ class DashboardApp(tk.Tk):
             if cur == "\u20b9"
             else f"${(anomaly.baseline_median * anomaly.close_price) / 1e6:,.1f}M"
         )
+        q_str = f"{anomaly.fdr_q:.4f}" if anomaly.fdr_q is not None else "N/A"
         proj_note = " (Intraday Normalized)" if anomaly.is_live_projected else ""
         info_text = (
             f"SYMBOL: {symbol:<13} | SIGNAL: {anomaly.signal:<16} | CLOSE: {cur}{anomaly.close_price:,.2f} "
             f"| MEDIAN TURNOVER: {turnover_str}\n"
-            f"VOLUME STATS -> RVOL: {anomaly.rvol:.2f}x{proj_note} | Parametric Log-Z: {anomaly.z_score:+.2f}\u03c3 "
-            f"| Robust Log-MAD Z: {anomaly.modified_z_score:+.2f}\u03c3 | CLV: {anomaly.close_location_value*100:.0f}%\n"
+            f"VOLUME STATS -> RVOL: {anomaly.rvol:.2f}x{proj_note} | Log-Z: {anomaly.z_score:+.2f}\u03c3 "
+            f"| Log-MAD Z: {anomaly.modified_z_score:+.2f}\u03c3 | p: {anomaly.p_value:.4f} (BH q: {q_str}) | CLV: {anomaly.close_location_value*100:.0f}%\n"
             f"DONCHIAN ({donchian_n}) -> Upper: {cur}{anomaly.donchian_upper:,.2f} | Mid: {cur}{anomaly.donchian_mid:,.2f} "
             f"| Lower: {cur}{anomaly.donchian_lower:,.2f} | Width: {anomaly.channel_width_pct:.1f}%\n"
             f"WILDER ATR(14): {cur}{anomaly.atr:,.2f} | INITIAL STOP (2xATR): {cur}{anomaly.stop_loss:,.2f} "
@@ -402,7 +417,7 @@ class DashboardApp(tk.Tk):
             self.ax_price.axhline(anomaly.target_price, color="#00e676", lw=0.9, ls="-.", alpha=0.7, label="4xATR Target (2R)")
 
         self.ax_price.set_title(
-            f"{symbol} ({self.interval_var.get()}) \u2014 {anomaly.signal} [RVOL {anomaly.rvol:.2f}x | Z {anomaly.effective_z:+.2f}\u03c3]",
+            f"{symbol} ({scan_interval}) \u2014 {anomaly.signal} [RVOL {anomaly.rvol:.2f}x | Z {anomaly.effective_z:+.2f}\u03c3]",
             color="#ffffff",
             fontsize=10,
             fontweight="bold",
@@ -412,11 +427,20 @@ class DashboardApp(tk.Tk):
 
         colors = ["#00e676" if c >= o else "#ff5252" for c, o in zip(sub_df["Close"], sub_df["Open"])]
         self.ax_vol.bar(x, sub_df["Volume"], color=colors, alpha=0.82, width=0.7)
-        self.ax_vol.plot(x, med_vol[-n_plot:], color="#ffab40", lw=1.3, label=f"Median Vol ({config.BASELINE_WINDOW})")
+        if scan_interval != "1d" and anomaly.baseline_median > 0:
+            self.ax_vol.axhline(
+                anomaly.baseline_median,
+                color="#ffab40",
+                lw=1.3,
+                ls="--",
+                label=f"Same-Slot Med Vol ({anomaly.baseline_median:,.0f})",
+            )
+        else:
+            self.ax_vol.plot(x, med_vol[-n_plot:], color="#ffab40", lw=1.3, label=f"Median Vol ({config.BASELINE_WINDOW})")
         self.ax_vol.grid(True, linestyle=":", alpha=0.25, color="#666666")
         self.ax_vol.legend(loc="upper left", fontsize=7.5, facecolor="#1b1b1f", edgecolor="#333338", labelcolor="#e4e4e8")
 
-        fmt = "%d-%b %H:%M" if self.interval_var.get() != "1d" else "%d-%b"
+        fmt = "%d-%b %H:%M" if scan_interval != "1d" else "%d-%b"
         ticks = x[:: max(1, len(x) // 8)]
         self.ax_vol.set_xticks(ticks)
         self.ax_vol.set_xticklabels([sub_df.index[i].strftime(fmt) for i in ticks], rotation=20, ha="right")

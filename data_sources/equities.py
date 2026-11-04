@@ -29,7 +29,7 @@ LAST_SCAN_STATS: Dict[str, int] = {
 }
 
 DEFAULT_PERIOD_BY_INTERVAL = {
-    "5m": "5d",
+    "5m": "1mo",
     "15m": "1mo",
     "30m": "1mo",
     "1h": "3mo",

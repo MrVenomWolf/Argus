@@ -153,6 +153,41 @@ class TestMathematicalEngine(unittest.TestCase):
         sig_valid = classify_signal(113.5, 115.0, 100.0, 104.0, 105.0, 90.0, 97.5, 13.5 / 15.0)
         self.assertEqual(sig_valid, "LONG BREAKOUT")
 
+    def test_insufficient_donchian_history_rejected(self):
+        """F25: Requesting a 100-bar Donchian channel with only 21 observations must return []."""
+        pts = [
+            DataPoint(
+                "eq",
+                "TEST.NS",
+                datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=i),
+                100.0 + i % 4 if i < 20 else 1000.0,
+                raw={"open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0},
+            )
+            for i in range(21)
+        ]
+        self.assertEqual(len(find_anomalies(pts, donchian_window=100, min_turnover_cr=0.0)), 0)
+
+    def test_marked_to_market_unrealized_drawdown_and_inf_pf(self):
+        """F13 & F31: Track unrealized drawdown while trade is open and return inf PF when loss_sum==0."""
+        n = 30
+        close = np.full(n, 100.0)
+        op = close.copy()
+        high, low = close + 1.0, close - 1.0
+        vol = np.array([100_000.0 * (1.0 + 0.05 * (i % 4)) for i in range(n)])
+        # Bar 21: valid breakout
+        close[21], op[21], high[21], low[21], vol[21] = 110.0, 108.0, 111.0, 107.0, 1_000_000.0
+        # Bar 22: enters at 110, surges to 200
+        op[22], close[22], high[22], low[22] = 110.0, 200.0, 201.0, 109.0
+        # Bars 23..29: drops to 150 and stays there until end
+        op[23:], close[23:], high[23:], low[23:] = 150.0, 150.0, 151.0, 149.0
+        frame = pd.DataFrame({"Open": op, "High": high, "Low": low, "Close": close, "Volume": vol})
+
+        bt = backtest_donchian_volume(frame, symbol="MTM.NS", cost_pct=0.0, min_turnover_cr=0.0)
+        self.assertIsNotNone(bt)
+        self.assertEqual(bt.trades, 1)
+        self.assertGreater(bt.max_drawdown_pct, 0.0, "Unrealized drop from 200 to 150 must record >0% drawdown")
+        self.assertTrue(np.isinf(bt.profit_factor))
+
 
 class TestIntradayAndPipeline(unittest.TestCase):
 

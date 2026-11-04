@@ -57,9 +57,12 @@ def log_alerts_to_csv(anomalies: List[Anomaly], path: str = None) -> None:
                 "atr_14",
                 "stop_loss",
                 "target_2r",
+                "p_value",
+                "fdr_q",
             ])
         detected_at = datetime.now(timezone.utc).isoformat()
         for a in anomalies:
+            q_str = f"{a.fdr_q:.6f}" if a.fdr_q is not None else ""
             writer.writerow([
                 detected_at,
                 a.point.source,
@@ -78,5 +81,7 @@ def log_alerts_to_csv(anomalies: List[Anomaly], path: str = None) -> None:
                 f"{a.atr:.2f}",
                 f"{a.stop_loss:.2f}",
                 f"{a.target_price:.2f}",
+                f"{a.p_value:.6f}",
+                q_str,
             ])
     print(f"\nLogged {len(anomalies)} alert(s) to {path}")

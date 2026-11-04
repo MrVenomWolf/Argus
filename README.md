@@ -18,7 +18,7 @@ Includes both a **dark-themed Python Desktop Terminal (`gui.py`)** for market-wi
 * **Intraday & Partial-Session Volume Normalization**:
   * **Intraday Same-Slot Matching (`15m`, `1h`)**: Converts timestamps to each exchange's native timezone (`Asia/Kolkata` for `.NS`, `America/New_York` for US) and matches current volume against historical bars from the **exact same `(hour, minute)` slot** in both Python and Pine Script.
   * **Partial-Session Projection (`1d`)**: After 10:00 AM IST (at least 45 minutes into the NSE session), scales in-progress daily volume using a parametric U-curve session approximation (`t + 0.14 * sin(2πt)`).
-* **Shared-Signal Long-Only Backtester**: Both the live screener (`find_anomalies`) and the historical backtester (`backtest_donchian_volume`) call the same `_evaluate_bar_volume_and_turnover` and `classify_signal` functions. The backtester evaluates **long-only breakout trades**, fills entries and `DonchianMid` breakdown exits at the **next bar's Open (`Open[i+1]`)**, sizes positions via **1% Fixed-Fractional Equity Risk** divided by the `2× Wilder ATR(14)` stop distance, trails winners with a `2.5× ATR(14)` Chandelier stop (plus optional `4× ATR` target mode with conservative stop-first precedence), and deducts **`0.25%` round-trip NSE delivery costs** plus **`0.10 × ATR` stop-fill slippage**.
+* **Shared-Signal Long-Only Backtester**: Both the live screener (`find_anomalies`) and the historical backtester (`backtest_donchian_volume`) call the same `_evaluate_bar_volume_and_turnover` and `classify_signal` functions. The backtester evaluates **long-only breakout trades**, fills entries and `DonchianMid` breakdown exits at the **next bar's Open (`Open[i+1]`)**, sizes positions via **1% Fixed-Fractional Equity Risk** divided by the `2× Wilder ATR(14)` stop distance, tracks **marked-to-market unrealized drawdown** on every bar while positions are open, trails winners with a `2.5× ATR(14)` Chandelier stop (plus optional `4× ATR` target mode with conservative stop-first precedence), and deducts **`0.25%` round-trip NSE delivery costs** plus **`0.10 × ATR` stop-fill slippage**.
 * **Strict OHLCV Validation**: Rejects malformed or corrupted bars (`High < Low`, `High < max(O,C)`, `Low > min(O,C)`, non-positive prices, or negative volume) rather than silently clamping them, reporting rejected bar counts in `LAST_SCAN_STATS`.
 
 ---
@@ -155,10 +155,10 @@ python test_suite.py
 ```text
 ├── config.py                        <- Thresholds & lazy-loaded universe fetcher (ALL_NSE / Nifty 500 / Nifty 200 / SPX_500)
 ├── anomaly_engine.py                <- Vectorized engine (Log-Z, Log-MAD Z, SciPy Student-t FDR, Donchian, CLV, Wilder ATR, Backtester)
-├── alerts.py                        <- Console reporting & 17-column CSV alert logger
+├── alerts.py                        <- Console reporting & 19-column CSV alert logger (including p_value & fdr_q)
 ├── main.py                          <- CLI entry point with batched scanning, full-family BH-FDR & signal prioritization
 ├── gui.py                           <- Non-blocking dark Tkinter + Matplotlib quantitative terminal
-├── test_suite.py                    <- Unit & integration tests verifying math, SciPy t-tails, tied BH-FDR, OHLC validation, and pipeline
+├── test_suite.py                    <- 15 unit & integration tests verifying math, SciPy t-tails, MTM drawdown, OHLC validation, and pipeline
 ├── .github/workflows/tests.yml      <- GitHub Actions CI pipeline running test_suite.py on push/PR
 ├── docs/
 │   ├── dashboard.png                <- Quantitative Desktop Terminal preview
