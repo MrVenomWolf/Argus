@@ -78,8 +78,8 @@ Tested on **19,751 real daily stock-bars** (`80` NSE equities from `NIFTY_200` o
 ## Setup & Installation
 
 ```bash
-git clone https://github.com/MrVenomWolf/NSE-Trade-Anomaly-Detector.git
-cd NSE-Trade-Anomaly-Detector
+git clone https://github.com/MrVenomWolf/Argus.git
+cd Argus
 pip install -r requirements.txt
 ```
 
