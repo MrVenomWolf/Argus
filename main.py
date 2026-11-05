@@ -15,7 +15,7 @@ import threading
 from typing import Callable, List, Optional
 
 from alerts import log_alerts_to_csv, print_alerts
-from anomaly_engine import Anomaly, apply_benjamini_hochberg, find_anomalies
+from anomaly_engine import Anomaly, apply_benjamini_hochberg, compute_symbol_pvalue, find_anomalies
 import config
 from data_sources import equities
 
@@ -78,9 +78,12 @@ def run(
         return []
 
     all_anomalies: List[Anomaly] = []
+    all_p_values: List[float] = []
     for symbol, points in by_symbol.items():
         if cancel_event is not None and cancel_event.is_set():
             break
+        if (p_val := compute_symbol_pvalue(points, interval=interval)) is not None:
+            all_p_values.append(p_val)
         all_anomalies.extend(
             find_anomalies(
                 points,
@@ -92,8 +95,8 @@ def run(
             )
         )
 
-    # Apply Benjamini-Hochberg FDR calibration across all tested symbols
-    apply_benjamini_hochberg(all_anomalies, total_tested=len(by_symbol))
+    # Apply Benjamini-Hochberg FDR calibration over the complete family of tested p-values
+    apply_benjamini_hochberg(all_anomalies, total_tested=len(all_p_values), all_p_values=all_p_values)
 
     # Sort: Actionable Donchian Breakouts first, then highest statistical Z-score
     all_anomalies.sort(

@@ -1,18 +1,19 @@
 """
 anomaly_engine.py
 ==================
-Quantitative Statistical Anomaly & Donchian Breakout Engine using vectorized
-NumPy and Pandas primitives.
+Quantitative Statistical Volume-Breakout & Strategy Engine using vectorized
+NumPy, Pandas, and SciPy primitives.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import math
 from typing import List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as scipy_student_t
 
 import config
 
@@ -36,8 +37,8 @@ class Anomaly:
     point: DataPoint
     baseline_median: float
     rvol: float
-    z_score: float
-    modified_z_score: float
+    z_score: float                      # Conventional parametric log-volume Z-score
+    modified_z_score: float             # Non-parametric log-MAD heuristic anti-masking score
     close_price: float = 0.0
     donchian_upper: float = 0.0
     donchian_lower: float = 0.0
@@ -50,8 +51,8 @@ class Anomaly:
     target_price: float = 0.0
     turnover_cr: float = 0.0
     is_live_projected: bool = False
-    p_value: float = 1.0
-    fdr_q: float = 1.0
+    p_value: float = 1.0                # Parametric predictive Student-t p-value (from z_score)
+    fdr_q: Optional[float] = None       # Benjamini-Hochberg adjusted q-value from parametric p_value
 
     @property
     def currency(self) -> str:
@@ -60,9 +61,9 @@ class Anomaly:
     @property
     def effective_z(self) -> float:
         """
-        Uses Parametric Log-Z by default (higher efficiency on small N=20 samples),
-        and switches to Log-MAD Z only when historical variance is inflated by a
-        prior outlier in the window (preventing both variance masking and MAD noise inflation).
+        Uses Parametric Log-Z by default, promoting the heuristic Log-MAD score
+        only when a prior outlier in the window inflated sample std (modified_z > 1.40 * z_score).
+        Note: `p_value` and `fdr_q` always report the parametric Student-t significance of `z_score`.
         """
         if self.modified_z_score > self.z_score * 1.40 and self.z_score > 0.5:
             return self.modified_z_score
@@ -91,6 +92,7 @@ class Anomaly:
 
 @dataclass
 class BacktestResult:
+    """Long-only historical backtest metrics comparing volume-confirmed vs raw Donchian breakouts."""
     symbol: str
     total_bars: int
     trades: int
@@ -107,8 +109,7 @@ class BacktestResult:
 def nse_intraday_volume_fraction(now_ist: Optional[datetime] = None) -> Tuple[float, bool]:
     """
     Parametric U-curve approximation of cumulative daily NSE volume (09:15-15:30 IST).
-    Requires at least 45 minutes elapsed (>= 10:00 IST, mins >= 600) before projecting
-    to avoid noisy early-morning multipliers.
+    Requires at least 45 minutes elapsed (>= 10:00 IST, mins >= 600) before projecting.
     """
     now_ist = (now_ist or datetime.now(IST)).astimezone(IST)
     mins = now_ist.hour * 60 + now_ist.minute
@@ -121,24 +122,40 @@ def nse_intraday_volume_fraction(now_ist: Optional[datetime] = None) -> Tuple[fl
 
 
 def student_t_one_sided_pvalue(t_stat: float, df: int = 19) -> float:
-    """Wallace (1959) Student-t to Normal tail conversion using standard-library `math.erfc`."""
-    if t_stat <= 0 or df < 2:
-        return 0.5
-    z_eq = math.sqrt(df * math.log1p((t_stat * t_stat) / df) * (1.0 - 0.5 / df))
-    return 0.5 * math.erfc(z_eq / math.sqrt(2.0))
+    """Exact one-sided Student-t survival probability P(T >= t_stat) via `scipy.stats.t.sf`."""
+    if not np.isfinite(t_stat) or df < 1:
+        return 1.0
+    return float(scipy_student_t.sf(t_stat, df=df))
 
 
-def apply_benjamini_hochberg(anomalies: List[Anomaly], total_tested: int) -> List[Anomaly]:
-    """Computes Benjamini-Hochberg (1995) False Discovery Rate q-values across `total_tested` symbols."""
+def apply_benjamini_hochberg(
+    anomalies: List[Anomaly],
+    total_tested: int,
+    all_p_values: Optional[List[float]] = None,
+) -> List[Anomaly]:
+    """
+    Computes Benjamini-Hochberg (1995) False Discovery Rate q-values across `total_tested` symbols.
+    Tied p-values are handled conservatively as a group using `side="left"` ranks so all tied
+    observations receive the same conservative adjusted q-value.
+    """
     if not anomalies:
         return anomalies
-    m = max(total_tested, len(anomalies))
-    ordered = sorted(anomalies, key=lambda a: a.p_value)
-    running_min = 1.0
-    for rank in range(len(ordered), 0, -1):
-        a = ordered[rank - 1]
-        running_min = min(running_min, (a.p_value * m) / rank)
-        a.fdr_q = running_min
+
+    if all_p_values and len(all_p_values) >= len(anomalies):
+        p_arr = np.sort(np.asarray(all_p_values, dtype=float))
+    else:
+        p_arr = np.sort(np.asarray([a.p_value for a in anomalies], dtype=float))
+
+    m = max(total_tested, len(p_arr))
+    # Conservative tie-handling: assign the first (smallest) 1-based rank to all members of a tie
+    ranks = np.searchsorted(p_arr, p_arr, side="left").astype(float) + 1.0
+    raw_q = (p_arr * m) / ranks
+    bh_q = np.clip(np.minimum.accumulate(raw_q[::-1])[::-1], 0.0, 1.0)
+
+    for a in anomalies:
+        idx = int(np.searchsorted(p_arr, a.p_value, side="left"))
+        idx = max(0, min(len(p_arr) - 1, idx))
+        a.fdr_q = float(bh_q[idx])
     return anomalies
 
 
@@ -260,6 +277,55 @@ def classify_signal(
     return "VOL SPIKE"
 
 
+def _evaluate_bar_volume_and_turnover(
+    hist_vols: np.ndarray,
+    prior_closes: np.ndarray,
+    eff_vol: float,
+    close_t: float,
+    min_rvol: float,
+    min_z_score: float,
+    min_turnover_cr: float,
+    is_daily: bool,
+) -> Tuple[bool, float, float, float, float, float]:
+    """
+    Shared volume & turnover evaluation gate called by BOTH `find_anomalies` (live scanner)
+    and `backtest_donchian_volume` (historical backtester) to guarantee signal parity.
+    Returns (passed_gate, baseline_med, rvol, z_score, modified_z, turnover_cr).
+    """
+    baseline_med, rvol, z_score, modified_z = calculate_robust_metrics(hist_vols, eff_vol)
+    eff_z = modified_z if (modified_z > z_score * 1.40 and z_score > 0.5) else z_score
+
+    if len(prior_closes) == len(hist_vols) and np.all(prior_closes > 0):
+        turnover_cr = float(np.median(hist_vols * prior_closes)) / 1e7
+    else:
+        turnover_cr = (baseline_med * close_t) / 1e7 if close_t > 0 else 0.0
+
+    if eff_z < min_z_score or rvol < min_rvol:
+        return False, baseline_med, rvol, z_score, modified_z, turnover_cr
+    if is_daily and min_turnover_cr > 0 and close_t > 0 and turnover_cr < min_turnover_cr:
+        return False, baseline_med, rvol, z_score, modified_z, turnover_cr
+    return True, baseline_med, rvol, z_score, modified_z, turnover_cr
+
+
+def compute_symbol_pvalue(
+    points: List[DataPoint],
+    window: int = None,
+    interval: str = "1d",
+) -> Optional[float]:
+    """Computes the parametric predictive Student-t p-value for a symbol."""
+    window = window if (window is not None and window > 0) else config.BASELINE_WINDOW
+    if not points or len(points) < window + 1:
+        return None
+    points = sorted(points, key=lambda p: p.timestamp)
+    hist_vols, eff_vol, _ = _select_baseline_history(points, window=window, interval=interval)
+    n_valid = int(np.sum(np.isfinite(hist_vols) & (hist_vols > 0)))
+    if n_valid < 5:
+        return None
+    _, _, z_score, _ = calculate_robust_metrics(hist_vols, eff_vol)
+    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_valid)
+    return student_t_one_sided_pvalue(t_stat, df=max(4, n_valid - 1))
+
+
 def find_anomalies(
     points: List[DataPoint],
     min_rvol: float = None,
@@ -270,26 +336,18 @@ def find_anomalies(
     only_breakouts: bool = False,
     min_turnover_cr: float = None,
 ) -> List[Anomaly]:
-    window = window or config.BASELINE_WINDOW
-    donchian_window = donchian_window or config.DONCHIAN_WINDOW
+    window = window if (window is not None and window > 0) else config.BASELINE_WINDOW
+    donchian_window = (
+        donchian_window if (donchian_window is not None and donchian_window > 0) else config.DONCHIAN_WINDOW
+    )
     min_rvol = min_rvol if min_rvol is not None else config.MIN_RVOL
     min_z_score = min_z_score if min_z_score is not None else config.MIN_Z_SCORE
     min_turnover_cr = min_turnover_cr if min_turnover_cr is not None else config.MIN_MEDIAN_TURNOVER_CR
 
-    if not points or len(points) < window + 1:
+    if not points or len(points) < max(window, donchian_window) + 1:
         return []
 
     points = sorted(points, key=lambda p: p.timestamp)
-    hist_vols, eff_vol, is_proj = _select_baseline_history(points, window=window, interval=interval)
-    baseline_med, rvol, z_score, modified_z = calculate_robust_metrics(hist_vols, eff_vol)
-
-    # Anti-masking gate: only promote modified_z when a prior spike inflated sample std relative to MAD
-    eff_z = modified_z if (modified_z > z_score * 1.40 and z_score > 0.5) else z_score
-    if eff_z < min_z_score or rvol < min_rvol:
-        return []
-
-    p_val = student_t_one_sided_pvalue(eff_z, df=max(4, len(hist_vols) - 1))
-
     ohlc = np.array(
         [
             (
@@ -305,9 +363,25 @@ def find_anomalies(
     closes, highs, lows, opens = ohlc.T
     close_t, high_t, low_t, open_t = closes[-1], highs[-1], lows[-1], opens[-1]
 
-    turnover_cr = (baseline_med * close_t) / 1e7 if close_t > 0 else 0.0
-    if interval == "1d" and min_turnover_cr > 0 and close_t > 0 and turnover_cr < min_turnover_cr:
+    hist_vols, eff_vol, is_proj = _select_baseline_history(points, window=window, interval=interval)
+    prior_closes = closes[-(window + 1) : -1]
+
+    passed, baseline_med, rvol, z_score, modified_z, turnover_cr = _evaluate_bar_volume_and_turnover(
+        hist_vols=hist_vols,
+        prior_closes=prior_closes,
+        eff_vol=eff_vol,
+        close_t=close_t,
+        min_rvol=min_rvol,
+        min_z_score=min_z_score,
+        min_turnover_cr=min_turnover_cr,
+        is_daily=(interval == "1d"),
+    )
+    if not passed:
         return []
+
+    n_valid = int(np.sum(np.isfinite(hist_vols) & (hist_vols > 0)))
+    t_stat = z_score / math.sqrt(1.0 + 1.0 / n_valid) if n_valid > 0 else 0.0
+    p_val = student_t_one_sided_pvalue(t_stat, df=max(4, n_valid - 1))
 
     d_upper = float(np.max(highs[-(donchian_window + 1) : -1]))
     d_lower = float(np.min(lows[-(donchian_window + 1) : -1]))
@@ -322,7 +396,7 @@ def find_anomalies(
     if only_breakouts and signal not in ("LONG BREAKOUT", "SHORT BREAKDOWN"):
         return []
 
-    direction = -1.0 if signal == "SHORT BREAKDOWN" else 1.0
+    direction = -1.0 if signal in ("SHORT BREAKDOWN", "BEARISH DISTRIB") else 1.0
     stop_loss = max(0.0, close_t - direction * config.ATR_STOP_MULT * atr_val)
     target_price = max(0.0, close_t + direction * config.ATR_TARGET_MULT * atr_val)
 
@@ -346,7 +420,7 @@ def find_anomalies(
             turnover_cr=turnover_cr,
             is_live_projected=is_proj,
             p_value=p_val,
-            fdr_q=p_val,
+            fdr_q=None,
         )
     ]
 
@@ -359,7 +433,15 @@ def backtest_donchian_volume(
     min_rvol: float = None,
     min_z_score: float = None,
     cost_pct: float = None,
+    use_target: bool = False,
+    min_turnover_cr: float = None,
 ) -> Optional[BacktestResult]:
+    """
+    Long-only historical backtester evaluating `LONG BREAKOUT` signals using the
+    shared `_evaluate_bar_volume_and_turnover` and `classify_signal` rules.
+      - Default exit (`use_target=False`): 2.5*ATR Chandelier trail + next-open DonchianMid exit.
+      - Target exit (`use_target=True`)  : Also exits at 4.0*ATR target (with stop-first precedence).
+    """
     if df is None or df.empty:
         return None
 
@@ -368,6 +450,11 @@ def backtest_donchian_volume(
     min_rvol = min_rvol if min_rvol is not None else config.MIN_RVOL
     min_z_score = min_z_score if min_z_score is not None else config.MIN_Z_SCORE
     cost_pct = cost_pct if cost_pct is not None else config.NSE_ROUND_TRIP_COST_PCT
+    min_turnover_cr = (
+        min_turnover_cr
+        if min_turnover_cr is not None
+        else (config.MIN_MEDIAN_TURNOVER_CR if symbol.endswith(".NS") else 0.0)
+    )
 
     start_idx = max(window, donchian_window, config.ATR_PERIOD) + 1
     if len(df) < start_idx + 4:
@@ -378,11 +465,25 @@ def backtest_donchian_volume(
         for col in ("Close", "High", "Low", "Open", "Volume")
     )
     atr = compute_wilder_atr(highs, lows, closes, period=config.ATR_PERIOD)
-    d_upper, _, d_mid = compute_donchian_channels(highs, lows, window=donchian_window)
+    d_upper, d_lower, d_mid = compute_donchian_channels(highs, lows, window=donchian_window)
+
+    tz = IST if symbol.endswith(".NS") else NY_TZ
+    slots: Optional[List[Tuple[int, int]]] = None
+    if hasattr(df.index, "tz") or isinstance(df.index, pd.DatetimeIndex):
+        sample_slots = [
+            _to_exchange_hm(ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts, tz)
+            for ts in df.index[: min(len(df), 30)]
+        ]
+        if len(set(sample_slots)) > 1:
+            slots = [
+                _to_exchange_hm(ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts, tz)
+                for ts in df.index
+            ]
+    is_daily = slots is None
 
     def _simulate(require_vol: bool):
-        in_pos, pending_entry = False, False
-        entry, risk, stop, hi_close, pos_weight = 0.0, 0.0, 0.0, 0.0, 1.0
+        in_pos, pending_entry, pending_exit = False, False, False
+        entry, risk, stop, target, hi_close, pos_weight = 0.0, 0.0, 0.0, 0.0, 0.0, 1.0
         r_mults, rets = [], []
         eq, peak, max_dd = 1.0, 1.0, 0.0
         slip_frac = getattr(config, "STOP_SLIPPAGE_ATR_FRAC", 0.10)
@@ -393,22 +494,32 @@ def backtest_donchian_volume(
             if not np.isfinite(c) or c <= 0:
                 continue
 
-            # Fill pending signal from bar i-1 at bar i's Open (no same-bar close bias)
             if pending_entry and not in_pos:
-                pending_entry = False
+                pending_entry, pending_exit = False, False
                 entry = o if (np.isfinite(o) and o > 0) else c
                 risk = max(entry * 0.01, config.ATR_STOP_MULT * atr[i - 1])
                 stop = entry - risk
+                target = entry + config.ATR_TARGET_MULT * atr[i - 1]
                 hi_close = entry
                 stop_dist_frac = risk / entry
                 pos_weight = min(1.0, risk_pct / stop_dist_frac) if stop_dist_frac > 1e-9 else 1.0
                 in_pos = True
 
             if in_pos:
+                prev_atr = atr[i - 1]
                 hit_stop = l <= stop
-                if hit_stop or c < d_mid[i] or i == len(closes) - 1:
-                    raw_exit = (min(o, stop) if o < stop else stop) if hit_stop else c
-                    exit_px = max(0.01, raw_exit - (slip_frac * atr[i] if hit_stop else 0.0))
+                hit_target = use_target and (not hit_stop) and (h >= target)
+                is_last = i == len(closes) - 1
+                if pending_exit or hit_stop or hit_target or is_last:
+                    if pending_exit:
+                        exit_px = o if (np.isfinite(o) and o > 0) else c
+                    elif hit_stop:
+                        raw_exit = min(o, stop) if o < stop else stop
+                        exit_px = max(0.01, raw_exit - slip_frac * prev_atr)
+                    elif hit_target:
+                        exit_px = max(o, target) if o > target else target
+                    else:
+                        exit_px = c
                     net_ret = ((exit_px - entry) / entry) - (cost_pct / 100.0)
                     r_mult = (net_ret * entry) / risk if risk > 1e-9 else 0.0
                     sized_ret = pos_weight * net_ret
@@ -417,30 +528,58 @@ def backtest_donchian_volume(
                     eq *= 1.0 + sized_ret
                     peak = max(peak, eq)
                     max_dd = max(max_dd, (peak - eq) / peak)
-                    in_pos = False
+                    in_pos, pending_exit = False, False
                 else:
+                    # Track marked-to-market unrealized peak and drawdown while position is open
+                    mtm_close = eq * (1.0 + pos_weight * ((c - entry) / entry))
+                    mtm_low = eq * (1.0 + pos_weight * ((l - entry) / entry))
+                    peak = max(peak, mtm_close)
+                    max_dd = max(max_dd, (peak - mtm_low) / peak, (peak - mtm_close) / peak)
+
                     hi_close = max(hi_close, c)
-                    stop = max(stop, d_mid[i], hi_close - 2.5 * atr[i])
+                    stop = max(stop, hi_close - 2.5 * atr[i])
+                    if c < d_mid[i]:
+                        pending_exit = True
                 continue
 
-            if i >= len(closes) - 1 or c <= d_upper[i] or c < o:
+            if i >= len(closes) - 1:
                 continue
-            if require_vol:
-                clv = (c - l) / (h - l) if (h - l) > 1e-9 else 0.5
-                if clv < config.MIN_CLOSE_STRENGTH:
-                    continue
-                _, rvol_i, z_i, mod_z_i = calculate_robust_metrics(vols[i - window : i], v)
-                eff_z_i = mod_z_i if (mod_z_i > z_i * 1.40 and z_i > 0.5) else z_i
-                if rvol_i < min_rvol or eff_z_i < min_z_score:
-                    continue
 
-            pending_entry = True
+            if not require_vol:
+                if c > d_upper[i] and c >= o:
+                    pending_entry = True
+                continue
+
+            if slots is not None:
+                slot_vols = [vols[j] for j in range(i) if slots[j] == slots[i] and vols[j] > 0]
+                hist_v = np.array(slot_vols[-window:], dtype=float) if len(slot_vols) >= 5 else vols[i - window : i]
+            else:
+                hist_v = vols[i - window : i]
+            prior_c = closes[i - window : i]
+
+            passed, _, _, _, _, _ = _evaluate_bar_volume_and_turnover(
+                hist_vols=hist_v,
+                prior_closes=prior_c,
+                eff_vol=v,
+                close_t=c,
+                min_rvol=min_rvol,
+                min_z_score=min_z_score,
+                min_turnover_cr=min_turnover_cr,
+                is_daily=is_daily,
+            )
+            if not passed:
+                continue
+
+            clv = float(np.clip((c - l) / (h - l), 0.0, 1.0)) if (h - l) > 1e-9 else 0.5
+            sig = classify_signal(c, h, l, o, d_upper[i], d_lower[i], d_mid[i], clv)
+            if sig == "LONG BREAKOUT":
+                pending_entry = True
 
         if not rets:
             return 0, 0.0, 0.0, 0.0, 0.0, 0.0
         wins = [r for r in rets if r > 0]
         loss_sum = sum(-r for r in rets if r <= 0)
-        pf = (sum(wins) / loss_sum) if loss_sum > 1e-9 else (9.99 if wins else 0.0)
+        pf = (sum(wins) / loss_sum) if loss_sum > 1e-9 else (float("inf") if wins else 0.0)
         return len(rets), len(wins) / len(rets) * 100.0, pf, float(np.mean(r_mults)), (eq - 1.0) * 100.0, max_dd * 100.0
 
     t, wr, pf, avg_r, net, dd = _simulate(True)

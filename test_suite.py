@@ -4,13 +4,13 @@ test_suite.py
 Comprehensive unit and integration test suite verifying:
   1. Parametric Log Z-Score & Non-Parametric Log-MAD Z-Score math & edge cases
   2. Outlier-masking immunity & anti-masking promotion gate
-  3. Student-t one-sided p-value & Benjamini-Hochberg FDR calibration
+  3. Exact `scipy.stats.t.sf` Student-t p-values & conservative tie-grouped BH-FDR
   4. 1-Bar Shifted Donchian Channels & Close Location Value (CLV) bull-trap rejection
   5. Wilder's 14-period ATR (RMA smoothing) & Stop/Target math
   6. Intraday NSE U-Curve session projection (with 10:00 AM IST guard)
   7. Multi-timezone (`Asia/Kolkata`, `America/New_York`, `UTC`) intraday same-slot matching
-  8. Default ₹1 Cr liquidity turnover filter & Next-Open 1% Risk-Sized Backtester
-  9. Lazy `config.EQUITY_TICKERS` attribute & 17-column CSV alert logger
+  8. Shared signal & ₹1 Cr turnover filter across live scanner and long-only backtester
+  9. Strict OHLCV bar validation (rejecting malformed bars without silent clamping)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+from scipy.stats import t as scipy_student_t
 
 import alerts
 import anomaly_engine
@@ -101,16 +102,31 @@ class TestMathematicalEngine(unittest.TestCase):
         self.assertGreater(z_mad_robust, 4.0)
         self.assertGreater(z_mad_robust, z_log_masked * 1.40)
 
-    def test_student_t_and_benjamini_hochberg_fdr(self):
-        p = student_t_one_sided_pvalue(3.5, df=19)
-        self.assertAlmostEqual(p, 0.0012, places=3)
+    def test_exact_scipy_student_t_and_tied_benjamini_hochberg_fdr(self):
+        # Verify exact match with scipy.stats.t.sf across degrees of freedom and t-values
+        for df in (5, 10, 19, 60):
+            for t_val in (0.5, 1.5, 2.5, 3.5, 5.0):
+                p = student_t_one_sided_pvalue(t_val, df=df)
+                expected = float(scipy_student_t.sf(t_val, df=df))
+                self.assertAlmostEqual(p, expected, places=15)
 
+        # Verify conservative tie-handling in Benjamini-Hochberg
         dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        a1 = anomaly_engine.Anomaly(DataPoint("eq", "A.NS", dt, 100), 30, 3.3, 4.0, 4.0, p_value=0.0005)
-        a2 = anomaly_engine.Anomaly(DataPoint("eq", "B.NS", dt, 100), 30, 2.5, 2.6, 2.6, p_value=0.0080)
-        apply_benjamini_hochberg([a2, a1], total_tested=100)
-        self.assertAlmostEqual(a1.fdr_q, 0.05, places=4)
-        self.assertAlmostEqual(a2.fdr_q, 0.40, places=4)
+        t1 = anomaly_engine.Anomaly(DataPoint("eq", "TIE1.NS", dt, 100), 30, 3.0, 3.5, 3.5, p_value=0.0010)
+        t2 = anomaly_engine.Anomaly(DataPoint("eq", "TIE2.NS", dt, 100), 30, 3.0, 3.5, 3.5, p_value=0.0010)
+        t3 = anomaly_engine.Anomaly(DataPoint("eq", "OTHER.NS", dt, 100), 30, 2.5, 2.6, 2.6, p_value=0.0090)
+
+        apply_benjamini_hochberg(
+            [t3, t1, t2],
+            total_tested=100,
+            all_p_values=[0.0010, 0.0010, 0.0090] + [0.5] * 97,
+        )
+        # Tied p=0.0010 at ranks 1 and 2 both get conservative rank-1 q = 0.0010 * 100 / 1 = 0.10
+        self.assertAlmostEqual(t1.fdr_q, 0.10, places=6)
+        self.assertAlmostEqual(t2.fdr_q, 0.10, places=6)
+        self.assertEqual(t1.fdr_q, t2.fdr_q)
+        # Rank 3 (p=0.0090) gets 0.0090 * 100 / 3 = 0.30
+        self.assertAlmostEqual(t3.fdr_q, 0.30, places=6)
 
     def test_shifted_donchian_channel_excludes_current_bar(self):
         highs = np.array([100.0, 102.0, 105.0, 103.0, 104.0, 120.0])
@@ -137,30 +153,60 @@ class TestMathematicalEngine(unittest.TestCase):
         sig_valid = classify_signal(113.5, 115.0, 100.0, 104.0, 105.0, 90.0, 97.5, 13.5 / 15.0)
         self.assertEqual(sig_valid, "LONG BREAKOUT")
 
+    def test_insufficient_donchian_history_rejected(self):
+        """F25: Requesting a 100-bar Donchian channel with only 21 observations must return []."""
+        pts = [
+            DataPoint(
+                "eq",
+                "TEST.NS",
+                datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=i),
+                100.0 + i % 4 if i < 20 else 1000.0,
+                raw={"open": 100.0, "high": 102.0, "low": 99.0, "close": 101.0},
+            )
+            for i in range(21)
+        ]
+        self.assertEqual(len(find_anomalies(pts, donchian_window=100, min_turnover_cr=0.0)), 0)
+
+    def test_marked_to_market_unrealized_drawdown_and_inf_pf(self):
+        """F13 & F31: Track unrealized drawdown while trade is open and return inf PF when loss_sum==0."""
+        n = 30
+        close = np.full(n, 100.0)
+        op = close.copy()
+        high, low = close + 1.0, close - 1.0
+        vol = np.array([100_000.0 * (1.0 + 0.05 * (i % 4)) for i in range(n)])
+        # Bar 21: valid breakout
+        close[21], op[21], high[21], low[21], vol[21] = 110.0, 108.0, 111.0, 107.0, 1_000_000.0
+        # Bar 22: enters at 110, surges to 200
+        op[22], close[22], high[22], low[22] = 110.0, 200.0, 201.0, 109.0
+        # Bars 23..29: drops to 150 and stays there until end
+        op[23:], close[23:], high[23:], low[23:] = 150.0, 150.0, 151.0, 149.0
+        frame = pd.DataFrame({"Open": op, "High": high, "Low": low, "Close": close, "Volume": vol})
+
+        bt = backtest_donchian_volume(frame, symbol="MTM.NS", cost_pct=0.0, min_turnover_cr=0.0)
+        self.assertIsNotNone(bt)
+        self.assertEqual(bt.trades, 1)
+        self.assertGreater(bt.max_drawdown_pct, 0.0, "Unrealized drop from 200 to 150 must record >0% drawdown")
+        self.assertTrue(np.isinf(bt.profit_factor))
+
 
 class TestIntradayAndPipeline(unittest.TestCase):
 
     def test_nse_intraday_u_curve_bounds_and_early_guard(self):
         ist = anomaly_engine.IST
-        # 09:00 IST (pre-market) and 09:30 IST (< 10:00 guard) both return (1.0, False)
         self.assertEqual(nse_intraday_volume_fraction(datetime(2026, 11, 4, 9, 0, tzinfo=ist)), (1.0, False))
         self.assertEqual(nse_intraday_volume_fraction(datetime(2026, 11, 4, 9, 30, tzinfo=ist)), (1.0, False))
 
-        # 10:15 IST (1 hour into session) -> open=True, 0.20 <= f < 0.40
         f_morn, open_morn = nse_intraday_volume_fraction(datetime(2026, 11, 4, 10, 15, tzinfo=ist))
         self.assertTrue(open_morn)
         self.assertTrue(0.20 <= f_morn < 0.40)
 
-        # 12:30 IST (midday) -> open=True, f_morn < f_mid < 0.70
         f_mid, open_mid = nse_intraday_volume_fraction(datetime(2026, 11, 4, 12, 30, tzinfo=ist))
         self.assertTrue(open_mid)
         self.assertGreater(f_mid, f_morn)
 
-        # Saturday -> (1.0, False)
         self.assertEqual(nse_intraday_volume_fraction(datetime(2026, 11, 7, 11, 0, tzinfo=ist)), (1.0, False))
 
     def test_intraday_same_slot_volume_matching_across_timezones(self):
-        """Verify same-slot matching works for Asia/Kolkata (.NS), America/New_York (US), and UTC."""
         for tz_obj, sym in (
             (ZoneInfo("Asia/Kolkata"), "SLOT.NS"),
             (ZoneInfo("America/New_York"), "SPY"),
@@ -176,25 +222,46 @@ class TestIntradayAndPipeline(unittest.TestCase):
             anoms = find_anomalies(pts, min_rvol=2.0, min_z_score=2.5, window=10, interval="15m")
             self.assertEqual(len(anoms), 0, f"False morning open alarm triggered for {sym} in {tz_obj}")
 
-    def test_illiquid_penny_stock_filtered_by_default(self):
-        """Default MIN_MEDIAN_TURNOVER_CR=1.0 filters out < ₹1 Cr daily stocks automatically."""
-        pts = []
-        base_dt = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        for i in range(25):
-            dt = base_dt + timedelta(days=i)
-            vol = 10_000.0 * (1.0 + 0.1 * (i % 4)) if i < 24 else 60_000.0
-            pts.append(
-                DataPoint(
-                    "equity",
-                    "PENNY.NS",
-                    dt,
-                    vol,
-                    raw={"open": 15.0, "high": 16.5, "low": 14.8, "close": 16.2},
-                )
-            )
-        self.assertEqual(len(find_anomalies(pts, min_rvol=2.0, min_z_score=2.5, interval="1d")), 0)
+    def test_illiquid_penny_stock_filtered_in_scanner_and_backtester(self):
+        """Both `find_anomalies` and `backtest_donchian_volume` reject < ₹1 Cr daily stocks."""
+        dates = pd.date_range("2026-01-01", periods=35, freq="B")
+        opens = np.full(35, 15.0)
+        highs = np.full(35, 16.0)
+        lows = np.full(35, 14.8)
+        closes = np.full(35, 15.5)
+        vols = np.array([10_000.0 * (1.0 + 0.1 * (i % 4)) for i in range(35)])
+        # Inject a 6x volume breakout on bar 30, but daily turnover is only ₹1.5 Lakhs (< ₹1 Cr)
+        closes[30] = 18.0
+        highs[30] = 18.2
+        vols[30] = 60_000.0
 
-    def test_backtester_and_csv_logging(self):
+        df = pd.DataFrame({"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": vols}, index=dates)
+        pts, rej = equities._df_to_datapoints("PENNY.NS", df)
+        self.assertEqual(rej, 0)
+        self.assertEqual(len(find_anomalies(pts[:31], interval="1d")), 0)
+
+        bt = backtest_donchian_volume(df, symbol="PENNY.NS")
+        self.assertIsNotNone(bt)
+        self.assertEqual(bt.trades, 0, "Backtester must also reject < ₹1 Cr illiquid NSE stocks")
+
+    def test_malformed_ohlc_bars_rejected_not_clamped(self):
+        """Bars with High < Low, High < Close, or negative volume must be rejected and counted."""
+        dates = pd.date_range("2026-01-01", periods=5, freq="B")
+        df = pd.DataFrame(
+            {
+                "Open": [100.0, 100.0, 100.0, -5.0, 100.0],
+                "High": [110.0, 95.0, 105.0, 110.0, 110.0],   # Row 1 has High(95) < Low(98); Row 2 has High(105) < Close(108)
+                "Low": [95.0, 98.0, 95.0, 95.0, 95.0],
+                "Close": [105.0, 96.0, 108.0, 105.0, 105.0],
+                "Volume": [1000.0, 1000.0, 1000.0, 1000.0, -50.0],  # Row 3 has Open=-5; Row 4 has Volume=-50
+            },
+            index=dates,
+        )
+        pts, rejected = equities._df_to_datapoints("BAD.NS", df)
+        self.assertEqual(len(pts), 1)
+        self.assertEqual(rejected, 4)
+
+    def test_backtester_both_exit_modes_and_csv_logging(self):
         rng = np.random.default_rng(7)
         dates = pd.date_range("2025-01-01", periods=90, freq="B")
         closes = np.linspace(1000.0, 1250.0, 90) + rng.normal(0, 4.0, 90)
@@ -214,14 +281,18 @@ class TestIntradayAndPipeline(unittest.TestCase):
             {"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": vols},
             index=dates,
         )
-        pts = equities._df_to_datapoints("TESTBO.NS", df)
+        pts, rej = equities._df_to_datapoints("TESTBO.NS", df)
+        self.assertEqual(rej, 0)
         anoms = find_anomalies(pts, min_rvol=2.0, min_z_score=2.5, interval="1d")
         self.assertEqual(len(anoms), 1)
         self.assertEqual(anoms[0].signal, "LONG BREAKOUT")
 
-        bt = backtest_donchian_volume(df, symbol="TESTBO.NS")
-        self.assertIsNotNone(bt)
-        self.assertGreaterEqual(bt.trades, 1)
+        bt_trail = backtest_donchian_volume(df, symbol="TESTBO.NS", use_target=False)
+        bt_target = backtest_donchian_volume(df, symbol="TESTBO.NS", use_target=True)
+        self.assertIsNotNone(bt_trail)
+        self.assertIsNotNone(bt_target)
+        self.assertGreaterEqual(bt_trail.trades, 1)
+        self.assertGreaterEqual(bt_target.trades, 1)
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
             tmp_path = tmp.name
