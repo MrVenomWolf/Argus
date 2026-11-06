@@ -1,57 +1,102 @@
 //@version=5
-strategy("SPX Index & Options Momentum Breakout Strategy", shorttitle="SPX Vol-Donchian", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.02, slippage=1, calc_on_every_tick=true)
+strategy("SPX Intraday Directional Momentum Strategy", shorttitle="SPX Trade", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=20, commission_type=strategy.commission.percent, commission_value=0.02, slippage=1, calc_on_every_tick=false, pyramiding=0, max_bars_back=500)
 
 // ============================================================================
 // 1. SPX-CALIBRATED INPUT PARAMETERS
 // ============================================================================
-// Why SPX math differs from single NSE stocks:
-//   1. Central Limit Theorem on Index Volume: SPY/SPX aggregates 500 stocks,
-//      so volume variance is much tighter. A 1.35x RVOL / +1.6 sigma surge on
-//      SPX is equivalent to a 2.5x+ surge on a single midcap stock.
-//   2. Faster Intraday Structure: SPX momentum bursts run in 12-15 bar legs,
-//      guided by institutional Session VWAP.
-//   3. Quick In-and-Out Targets: SPX mean-reverts faster than single equities,
-//      favoring tighter ATR stops (1.5x) and quick take-profit limits (2.2x).
+// Experimental intraday defaults; validate on the selected instrument and feed.
 grp_vol = "1. SPX Volume Anomaly Engine (Index-Calibrated)"
-volWindow     = input.int(20,     "Volume Baseline Lookback (W)", minval=5, group=grp_vol)
+volWindow     = input.int(20,     "Volume Baseline Lookback (W)", minval=5, maxval=200, group=grp_vol)
 minRvol       = input.float(1.35, "Minimum SPX RVOL (vs Median)", minval=1.0, step=0.05, group=grp_vol)
 minZScore     = input.float(1.60, "Minimum SPX Log Z-Score (sigma)", minval=0.5, step=0.1, group=grp_vol)
 useSameSlot   = input.bool(false, "Use Same-Slot Time-of-Day Baseline (Intraday)", group=grp_vol)
 useSpyProxy   = input.bool(true,  "Auto-Use AMEX:SPY Volume on Cash SPX Index", group=grp_vol)
 
-grp_don = "2. SPX Donchian + Institutional VWAP Filter"
-donchianLen   = input.int(14,     "SPX Donchian Channel Length (N)", minval=5, group=grp_don)
+grp_don = "2. SPX Donchian + Session Weighted-Price Filter"
+donchianLen   = input.int(14,     "SPX Donchian Channel Length (N)", minval=5, maxval=200, group=grp_don)
 minClv        = input.float(0.60, "Min Close Location Value (CLV 0..1)", minval=0.1, maxval=0.95, step=0.05, group=grp_don)
-useVwapFilter = input.bool(true,  "Require Price Above/Below Session VWAP", group=grp_don)
-allowShorts   = input.bool(true,  "Enable Short Breakdown Trades (SPX Puts / ES)", group=grp_don)
+vwapRecovery = input.string("Strict session", "Weighted Average Gap Policy", options=["Strict session", "Restart after gap"], group=grp_don)
+vwapWarmupBars = input.int(3, "Recovery Warmup Valid Bars", minval=1, maxval=30, group=grp_don)
+useVwapFilter = input.bool(true,  "Require Price Above/Below Session Weighted Average", group=grp_don)
+allowShorts   = input.bool(true,  "Enable Short Breakdown Trades (Directional Shorts)", group=grp_don)
 
-grp_risk = "3. Quick In-and-Out ATR Stop & Target (SPX Options)"
-atrLen        = input.int(14,     "Wilder ATR Period", minval=5, group=grp_risk)
-atrStopMult   = input.float(1.5,  "Initial Hard Stop (x ATR)", minval=0.5, step=0.25, group=grp_risk)
-atrTrailMult  = input.float(1.8,  "Chandelier Trailing Stop (x ATR)", minval=0.5, step=0.25, group=grp_risk)
+grp_risk = "3. Quick In-and-Out ATR Stop & Target (Underlying Signals)"
+atrLen        = input.int(14,     "Wilder ATR Period", minval=5, maxval=200, group=grp_risk)
+atrStopMult   = input.float(1.5,  "Initial Hard Stop (x ATR)", minval=0.5, step=0.1, group=grp_risk)
+atrTrailMult  = input.float(1.8,  "Highest/Lowest Close Trail (x Entry ATR)", minval=0.5, step=0.1, group=grp_risk)
 useTakeProfit = input.bool(true,  "Enable Quick In-and-Out Take-Profit Limit", group=grp_risk)
-atrTargetMult = input.float(2.2,  "Quick Take-Profit Target (x ATR)", minval=0.5, step=0.25, group=grp_risk)
+atrTargetMult = input.float(2.2,  "Quick Take-Profit Target (x ATR)", minval=0.5, step=0.1, group=grp_risk)
 showHud       = input.bool(true,  "Show Live SPX Quantitative HUD Table", group=grp_risk)
 
-// ============================================================================
-// 2. VOLUME & VWAP RESOLUTION (AUTO-FALLBACK TO AMEX:SPY FOR SPX CASH INDEX)
-// ============================================================================
-[spyVol, spyHlc3] = request.security("AMEX:SPY", timeframe.period, [volume, hlc3], barmerge.gaps_off, barmerge.lookahead_off)
-bool  usingProxy  = useSpyProxy and (na(volume) or volume <= 0)
-float rawVol      = usingProxy ? nz(spyVol, 0.0) : nz(volume, 0.0)
-float logVol      = math.log(1.0 + math.max(0.0, rawVol))
+float effectiveRvol = minRvol
+float effectiveMinZ = minZScore
+int effectiveDonLen = donchianLen
+float effectiveClv = minClv
+float effectiveStopMult = atrStopMult
+float effectiveTargetMult = atrTargetMult
 
-// Compute volume-weighted average price (VWAP) using SPY volume when on cash SPX
-bool  isNewSession = ta.change(time("D")) != 0
-var float cumPV    = 0.0
-var float cumV     = 0.0
-if isNewSession
-    cumPV := hlc3 * rawVol
-    cumV  := rawVol
-else
+grp_session = "4. Intraday Session & Trade Limits"
+sessionHours = input.session("0930-1600", "Trading Session (adjust for half days)", group=grp_session)
+sessionZone = input.string("America/New_York", "Session IANA Timezone", group=grp_session)
+lastEntryHour = input.int(15, "Last Entry Hour", minval=0, maxval=23, group=grp_session)
+lastEntryMinute = input.int(30, "Last Entry Minute", minval=0, maxval=59, group=grp_session)
+flattenHour = input.int(15, "Flatten Hour", minval=0, maxval=23, group=grp_session)
+flattenMinute = input.int(50, "Flatten Minute", minval=0, maxval=59, group=grp_session)
+maxHoldBars = input.int(12, "Maximum Holding Bars (0 disables)", minval=0, group=grp_session)
+cooldownBars = input.int(2, "Full Bars to Wait After Exit", minval=0, group=grp_session)
+maxDailyTrades = input.int(6, "Maximum Entries Per Day (0 disables)", minval=0, group=grp_session)
+maxDailyLoss = input.float(2.0, "Daily Equity Loss Limit % (0 disables)", minval=0, step=0.25, group=grp_session)
+slotSamples = input.int(20, "Same-Slot Prior Sessions Required", minval=5, maxval=50, group=grp_vol)
+maxBaselineAge = input.int(3, "Rolling Maximum Age (x Lookback Bars)", minval=1, maxval=20, group=grp_vol)
+volumeMode = input.string("Auto", "Volume Source", options=["Auto", "Chart", "Proxy"], group=grp_vol)
+
+bool supportedTimeframe = timeframe.isminutes and timeframe.multiplier <= 15
+bool inSession = not na(time(timeframe.period, sessionHours + ":23456", sessionZone))
+int dateKey = year(time, sessionZone) * 10000 + month(time, sessionZone) * 100 + dayofmonth(time, sessionZone)
+bool newDay = na(dateKey[1]) or dateKey != dateKey[1]
+bool newSession = inSession and (newDay or not inSession[1])
+int entryDeadline = timestamp(sessionZone, year(time, sessionZone), month(time, sessionZone), dayofmonth(time, sessionZone), lastEntryHour, lastEntryMinute)
+int flatDeadline = timestamp(sessionZone, year(time, sessionZone), month(time, sessionZone), dayofmonth(time, sessionZone), flattenHour, flattenMinute)
+// Close on the bar reaching the deadline; entries need room before both deadlines.
+bool flattenNow = not inSession or time_close >= flatDeadline
+bool entryWindow = entryDeadline < flatDeadline and supportedTimeframe and inSession and time_close < entryDeadline and time_close < flatDeadline
+
+// ============================================================================
+// 2. STABLE VOLUME SOURCE & SESSION WEIGHTED PRICE
+// ============================================================================
+proxyTicker = input.symbol("AMEX:SPY", "Volume Proxy Symbol", group=grp_vol)
+bool autoProxy = useSpyProxy and syminfo.type == "index" and syminfo.ticker == "SPX"
+[proxyVol, proxyTime] = request.security(proxyTicker, timeframe.period, [volume, time], gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off, ignore_invalid_symbol=true)
+bool usingProxy = volumeMode == "Proxy" or (volumeMode == "Auto" and autoProxy)
+bool volumeValid = usingProxy ? (not na(proxyVol) and proxyVol > 0 and proxyTime == time) : (not na(volume) and volume > 0)
+float rawVol = volumeValid ? (usingProxy ? proxyVol : volume) : na
+float logVol = math.log(1.0 + rawVol)
+
+// Synthetic SPX average when using SPY volume; never compare raw SPY and SPX prices.
+var float cumPV = 0.0
+var float cumV = 0.0
+var bool completeSession = false
+var bool recoveringAverage = false
+var int weightedBars = 0
+if newSession
+    cumPV := 0.0
+    cumV := 0.0
+    weightedBars := 0
+    completeSession := not barstate.isfirst
+    recoveringAverage := barstate.isfirst
+if inSession and not volumeValid
+    completeSession := false
+    recoveringAverage := true
+    if vwapRecovery == "Restart after gap"
+        cumPV := 0.0
+        cumV := 0.0
+        weightedBars := 0
+if inSession and volumeValid
     cumPV += hlc3 * rawVol
-    cumV  += rawVol
-float sessionVwap = cumV > 0 ? (cumPV / cumV) : close
+    cumV += rawVol
+    weightedBars += 1
+bool recoveredAverage = vwapRecovery == "Restart after gap" and recoveringAverage and weightedBars >= vwapWarmupBars
+float sessionVwap = inSession and (completeSession or recoveredAverage) and cumV > 0 ? cumPV / cumV : na
 
 // ============================================================================
 // 3. OUTLIER-RESISTANT VOLUME MATH (INDEX-CALIBRATED)
@@ -63,52 +108,66 @@ array.clear(slotVolArr)
 array.clear(slotLogArr)
 array.clear(absDevArr)
 
-int curH = hour(time)
-int curM = minute(time)
+// Fixed-size minute-slot rings: no capped historical scan and no current-bar leakage.
+var float[] slotHistory = array.new_float(1440 * slotSamples, na)
+var int[] slotCounts = array.new_int(1440, 0)
+var int[] slotHeads = array.new_int(1440, 0)
+int slot = hour(time, sessionZone) * 60 + minute(time, sessionZone)
+int sampleCount = array.get(slotCounts, slot)
+if useSameSlot and inSession and sampleCount > 0
+    for k = 0 to sampleCount - 1
+        float sample = array.get(slotHistory, slot * slotSamples + k)
+        array.push(slotVolArr, sample)
+        array.push(slotLogArr, math.log(1.0 + sample))
+bool hasSlotHist = useSameSlot and array.size(slotVolArr) >= slotSamples
 
-if timeframe.isintraday and useSameSlot
-    int maxLookback = math.min(bar_index, 1200)
-    for k = 1 to maxLookback
-        if hour(time[k]) == curH and minute(time[k]) == curM and rawVol[k] > 0
-            array.push(slotVolArr, rawVol[k])
-            array.push(slotLogArr, logVol[k])
-            if array.size(slotVolArr) >= volWindow
-                break
-
-bool hasSlotHist = array.size(slotVolArr) >= 5
-
-// Evaluate rolling `ta.*` series unconditionally on every bar for Pine consistency
-float rollMedVol  = ta.median(rawVol[1], volWindow)
-float rollLogMean = ta.sma(logVol[1], volWindow)
-float rollLogStd  = ta.stdev(logVol[1], volWindow, false)
-float rollLogMed  = ta.median(logVol[1], volWindow)
-
-float baselineMedianVol = hasSlotHist ? array.median(slotVolArr) : rollMedVol
-float rvol              = baselineMedianVol > 0 ? (rawVol / baselineMedianVol) : 1.0
-
-float logMean = hasSlotHist ? array.avg(slotLogArr) : rollLogMean
-float logStd  = hasSlotHist ? array.stdev(slotLogArr, false) : rollLogStd
-float logZ    = logStd > 1e-9 ? (logVol - logMean) / logStd : 0.0
-
-float logMed  = hasSlotHist ? array.median(slotLogArr) : rollLogMed
-if hasSlotHist
-    for idx = 0 to array.size(slotLogArr) - 1
-        array.push(absDevArr, math.abs(array.get(slotLogArr, idx) - logMed))
-else
-    for i = 1 to volWindow
-        array.push(absDevArr, math.abs(logVol[i] - logMed))
+// All rolling statistics use the same prior valid observations.
+// Chart-bar age bounds prevent silently using arbitrarily old samples after gaps.
+var float[] rollingVol = array.new_float(0)
+var float[] rollingLog = array.new_float(0)
+var int[] rollingBars = array.new_int(0)
+int rollingCount = array.size(rollingVol)
+int rollingAge = rollingCount > 0 ? bar_index - array.get(rollingBars, 0) : 0
+bool rollingReady = rollingCount == volWindow and rollingAge <= volWindow * maxBaselineAge
+bool baselineReady = useSameSlot ? hasSlotHist : rollingReady
+float baselineMedianVol = baselineReady ? (useSameSlot ? array.median(slotVolArr) : array.median(rollingVol)) : na
+float rvol = volumeValid and baselineMedianVol > 0 ? rawVol / baselineMedianVol : na
+float logMean = baselineReady ? (useSameSlot ? array.avg(slotLogArr) : array.avg(rollingLog)) : na
+float logStd = baselineReady ? (useSameSlot ? array.stdev(slotLogArr, false) : array.stdev(rollingLog, false)) : na
+float logZ = not volumeValid or not baselineReady ? na : logStd > 1e-9 ? (logVol - logMean) / logStd : 0.0
+float logMed = baselineReady ? (useSameSlot ? array.median(slotLogArr) : array.median(rollingLog)) : na
+if baselineReady
+    int count = useSameSlot ? array.size(slotLogArr) : rollingCount
+    for i = 0 to count - 1
+        float sampleLog = useSameSlot ? array.get(slotLogArr, i) : array.get(rollingLog, i)
+        array.push(absDevArr, math.abs(sampleLog - logMed))
 
 float logMad    = array.size(absDevArr) > 0 ? array.median(absDevArr) : 0.0
 float modifiedZ = logMad > 1e-9 ? (0.67449 * (logVol - logMed)) / logMad : logZ
 
 float effectiveZ   = math.max(logZ, modifiedZ)
-bool  isVolAnomaly = barstate.isconfirmed and (rvol >= minRvol) and (effectiveZ >= minZScore)
+bool isVolAnomaly = barstate.isconfirmed and volumeValid and baselineReady and (rvol >= effectiveRvol) and (effectiveZ >= effectiveMinZ)
+// Store only after scoring. Include only valid in-session volume in rolling history.
+if barstate.isconfirmed and supportedTimeframe and inSession and volumeValid
+    array.push(rollingVol, rawVol)
+    array.push(rollingLog, logVol)
+    array.push(rollingBars, bar_index)
+    if array.size(rollingVol) > volWindow
+        array.shift(rollingVol)
+        array.shift(rollingLog)
+        array.shift(rollingBars)
+// Store only after scoring, so the current observation cannot influence its baseline.
+if barstate.isconfirmed and supportedTimeframe and inSession and volumeValid
+    int head = array.get(slotHeads, slot)
+    array.set(slotHistory, slot * slotSamples + head, rawVol)
+    array.set(slotHeads, slot, (head + 1) % slotSamples)
+    array.set(slotCounts, slot, math.min(sampleCount + 1, slotSamples))
 
 // ============================================================================
 // 4. SHIFTED DONCHIAN CHANNELS, VWAP FILTER, CLV & WILDER ATR
 // ============================================================================
-float donUpper = ta.highest(high, donchianLen)[1]
-float donLower = ta.lowest(low, donchianLen)[1]
+float donUpper = ta.highest(high, effectiveDonLen)[1]
+float donLower = ta.lowest(low, effectiveDonLen)[1]
 float donMid   = 0.5 * (donUpper + donLower)
 
 float barRange = high - low
@@ -116,47 +175,81 @@ float clv      = barRange > 1e-9 ? (close - low) / barRange : 0.5
 float atrVal   = ta.atr(atrLen)
 
 bool vwapActive = useVwapFilter and timeframe.isintraday
-bool vwapBullOk = not vwapActive or (close >= sessionVwap)
-bool vwapBearOk = not vwapActive or (close <= sessionVwap)
+bool vwapBullOk = not vwapActive or (not na(sessionVwap) and close >= sessionVwap)
+bool vwapBearOk = not vwapActive or (not na(sessionVwap) and close <= sessionVwap)
 
-bool longBreakout   = isVolAnomaly and (close > donUpper) and (clv >= minClv) and (close >= open) and vwapBullOk
-bool shortBreakdown = isVolAnomaly and (close < donLower) and (clv <= (1.0 - minClv)) and (close <= open) and vwapBearOk
+bool longBreakout   = isVolAnomaly and (close > donUpper) and (clv >= effectiveClv) and (close >= open) and vwapBullOk
+bool shortBreakdown = isVolAnomaly and (close < donLower) and (clv <= (1.0 - effectiveClv)) and (close <= open) and vwapBearOk
 
 // ============================================================================
 // 5. STRATEGY EXECUTION (QUICK IN-AND-OUT TARGET + TRAILING STOP)
 // ============================================================================
-var float activeStop   = na
+// Signal-time ATR defines relative brackets; actual fill anchors absolute levels.
+var float activeStop = na
 var float activeTarget = na
+var float entryAtr = na
+var float stopTicks = na
+var float targetTicks = na
 var float highestClose = na
-var float lowestClose  = na
+var float lowestClose = na
+var int entriesToday = 0
+var int lastExitBar = na
+var float dayStartEquity = na
+var bool dailyHalt = false
+if newDay or na(dayStartEquity)
+    entriesToday := 0
+    dayStartEquity := strategy.equity
+    dailyHalt := false
+if maxDailyLoss > 0 and strategy.equity <= dayStartEquity * (1.0 - maxDailyLoss / 100.0)
+    dailyHalt := true
+if ta.change(strategy.closedtrades) > 0
+    lastExitBar := strategy.closedtrades.exit_bar_index(strategy.closedtrades - 1)
+bool cooldownOk = na(lastExitBar) or bar_index - lastExitBar > cooldownBars
+bool canEnter = entryWindow and not dailyHalt and cooldownOk and (maxDailyTrades == 0 or entriesToday < maxDailyTrades) and strategy.position_size == 0 and not na(atrVal) and atrVal > 0
+bool enterLong = canEnter and longBreakout
+bool enterShort = canEnter and allowShorts and shortBreakdown
 
 if strategy.position_size == 0
-    if longBreakout
-        activeStop   := close - (atrStopMult * atrVal)
-        activeTarget := useTakeProfit ? close + (atrTargetMult * atrVal) : na
-        highestClose := close
-        strategy.entry("SPX Call / Long", strategy.long, alert_message="SPX LONG BREAKOUT")
-        strategy.exit("Long Exit", from_entry="SPX Call / Long", stop=activeStop, limit=activeTarget, alert_message="SPX LONG EXIT")
-    else if allowShorts and shortBreakdown
-        activeStop   := close + (atrStopMult * atrVal)
-        activeTarget := useTakeProfit ? math.max(0.01, close - (atrTargetMult * atrVal)) : na
-        lowestClose  := close
-        strategy.entry("SPX Put / Short", strategy.short, alert_message="SPX SHORT BREAKDOWN")
-        strategy.exit("Short Exit", from_entry="SPX Put / Short", stop=activeStop, limit=activeTarget, alert_message="SPX SHORT EXIT")
-else if strategy.position_size > 0
-    highestClose := math.max(nz(highestClose, close), close)
-    float chandelierStop = highestClose - (atrTrailMult * atrVal)
-    activeStop := math.max(nz(activeStop, chandelierStop), chandelierStop)
-    strategy.exit("Long Exit", from_entry="SPX Call / Long", stop=activeStop, limit=activeTarget, alert_message="SPX LONG EXIT")
-    if barstate.isconfirmed and close < donMid
-        strategy.close("SPX Call / Long", comment="Close < DonMid", alert_message="SPX LONG MID EXIT")
-else if strategy.position_size < 0
-    lowestClose := math.min(nz(lowestClose, close), close)
-    float chandelierStop = lowestClose + (atrTrailMult * atrVal)
-    activeStop := math.min(nz(activeStop, chandelierStop), chandelierStop)
-    strategy.exit("Short Exit", from_entry="SPX Put / Short", stop=activeStop, limit=activeTarget, alert_message="SPX SHORT EXIT")
-    if barstate.isconfirmed and close > donMid
-        strategy.close("SPX Put / Short", comment="Close > DonMid", alert_message="SPX SHORT MID EXIT")
+    activeStop := na
+    activeTarget := na
+    highestClose := na
+    lowestClose := na
+if flattenNow or dailyHalt or not supportedTimeframe
+    strategy.cancel_all()
+    strategy.close_all(comment=dailyHalt ? "Daily loss limit" : "Session exit", alert_message="INTRADAY FLATTEN", immediately=true)
+else if enterLong or enterShort
+    entryAtr := atrVal
+    stopTicks := math.max(1.0, math.round(effectiveStopMult * entryAtr / syminfo.mintick))
+    targetTicks := math.max(1.0, math.round(effectiveTargetMult * entryAtr / syminfo.mintick))
+    entriesToday += 1
+    if enterLong
+        strategy.entry("Long", strategy.long, alert_message="BULLISH BREAKOUT: CHART INSTRUMENT")
+        strategy.exit("Long Exit", "Long", loss=stopTicks, profit=useTakeProfit ? targetTicks : na, alert_message="LONG EXIT")
+    else
+        strategy.entry("Short", strategy.short, alert_message="BEARISH BREAKDOWN: CHART INSTRUMENT")
+        strategy.exit("Short Exit", "Short", loss=stopTicks, profit=useTakeProfit ? targetTicks : na, alert_message="SHORT EXIT")
+else if strategy.position_size != 0
+    float fill = strategy.position_avg_price
+    bool longPosition = strategy.position_size > 0
+    if longPosition
+        highestClose := math.max(nz(highestClose, fill), close)
+        float initialStop = fill - stopTicks * syminfo.mintick
+        float trail = math.round_to_mintick(highestClose - atrTrailMult * entryAtr)
+        activeStop := math.max(nz(activeStop, initialStop), trail)
+        activeTarget := useTakeProfit ? fill + targetTicks * syminfo.mintick : na
+        strategy.exit("Long Exit", "Long", stop=activeStop, limit=activeTarget, alert_message="LONG EXIT")
+    else
+        lowestClose := math.min(nz(lowestClose, fill), close)
+        float initialStop = fill + stopTicks * syminfo.mintick
+        float trail = math.round_to_mintick(lowestClose + atrTrailMult * entryAtr)
+        activeStop := math.min(nz(activeStop, initialStop), trail)
+        activeTarget := useTakeProfit ? fill - targetTicks * syminfo.mintick : na
+        strategy.exit("Short Exit", "Short", stop=activeStop, limit=activeTarget, alert_message="SHORT EXIT")
+    int heldBars = bar_index - strategy.opentrades.entry_bar_index(0) + 1
+    bool timeExit = maxHoldBars > 0 and heldBars >= maxHoldBars
+    bool midExit = longPosition ? close < donMid : close > donMid
+    if timeExit or midExit
+        strategy.close_all(comment=timeExit ? "Time stop" : "Donchian midpoint", alert_message="TIME / MIDPOINT EXIT", immediately=true)
 
 // ============================================================================
 // 6. VISUAL PLOTS (CLEAN STATUS LINE WITH `display=display.pane`) & LIVE HUD
@@ -166,42 +259,41 @@ pMid   = plot(donMid,   "Donchian Mid",   color=color.new(#ffab40, 35), linewidt
 pLower = plot(donLower, "Donchian Lower", color=color.new(#ff5252, 25), linewidth=2)
 fill(pUpper, pLower, color=color.new(#007acc, 92), title="Donchian Channel Fill")
 
-plot(timeframe.isintraday ? sessionVwap : na, "Session VWAP", color=color.new(#e040fb, 20), linewidth=2, display=display.pane)
+plot(timeframe.isintraday ? sessionVwap : na, "Session Weighted Average (Synthetic with Proxy)", color=color.new(#e040fb, 20), linewidth=2, display=display.pane)
 plot(strategy.position_size != 0 ? activeStop : na, "Active Trailing Stop", color=color.new(#ff1744, 0), linewidth=2, style=plot.style_linebr, display=display.pane)
 plot(strategy.position_size != 0 and useTakeProfit ? activeTarget : na, "Quick Profit Target", color=color.new(#00e676, 0), linewidth=2, style=plot.style_linebr, display=display.pane)
 
-plotshape(longBreakout, title="Call / Long Breakout", style=shape.triangleup, location=location.belowbar, color=#00e676, size=size.small, text="CALL", display=display.pane)
-plotshape(shortBreakdown, title="Put / Short Breakdown", style=shape.triangledown, location=location.abovebar, color=#ff5252, size=size.small, text="PUT", display=display.pane)
+plotshape(enterLong, title="Eligible Long Breakout", style=shape.triangleup, location=location.belowbar, color=#00e676, size=size.small, text="LONG", display=display.pane)
+plotshape(enterShort, title="Eligible Short Breakdown", style=shape.triangledown, location=location.abovebar, color=#ff5252, size=size.small, text="SHORT", display=display.pane)
 barcolor(longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c4ff : na)
 
+var table hud = table.new(position.top_right, 2, 12, bgcolor=color.new(#18181c, 10), border_width=1)
 if showHud and barstate.islast
-    var table hud = table.new(position.top_right, 2, 8, bgcolor=color.new(#18181c, 10), border_color=#333338, border_width=1)
-    bool   isShortBias = shortBreakdown or strategy.position_size < 0
-    string sigText = longBreakout ? "BUY CALL (LONG)" : shortBreakdown ? "BUY PUT (SHORT)" : isVolAnomaly ? "VOL EXPANSION" : "RANGE / WAIT"
-    color  sigCol  = longBreakout ? #00e676 : shortBreakdown ? #ff5252 : isVolAnomaly ? #40c4ff : #aaaaaa
-    float  hudStop = isShortBias ? (close + atrStopMult * atrVal) : (close - atrStopMult * atrVal)
-    float  hudTgt  = isShortBias ? math.max(0.0, close - atrTargetMult * atrVal) : (close + atrTargetMult * atrVal)
-
-    table.cell(hud, 0, 0, "SPX SIGNAL", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 0, sigText, text_color=sigCol, text_size=size.small)
-
-    table.cell(hud, 0, 1, "VOL FEED / VWAP", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 1, (usingProxy ? "SPY Vol | " : "Chart Vol | ") + (close >= sessionVwap ? "Above VWAP" : "Below VWAP"), text_color=close >= sessionVwap ? #00e676 : #ff5252, text_size=size.small)
-
-    table.cell(hud, 0, 2, "SPX RVOL (vs Med)", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 2, str.tostring(rvol, "#.##") + "x", text_color=rvol >= minRvol ? #00e676 : #ffffff, text_size=size.small)
-
-    table.cell(hud, 0, 3, "Parametric Log-Z", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 3, str.tostring(logZ, "+#.##") + "s", text_color=logZ >= minZScore ? #00e676 : #ffffff, text_size=size.small)
-
-    table.cell(hud, 0, 4, "Robust Log-MAD Z", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 4, str.tostring(modifiedZ, "+#.##") + "s", text_color=modifiedZ >= minZScore ? #00e676 : #ffffff, text_size=size.small)
-
-    table.cell(hud, 0, 5, "Close Strength (CLV)", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 5, str.tostring(clv * 100, "#") + "%", text_color=clv >= minClv ? #00e676 : #ffffff, text_size=size.small)
-
-    table.cell(hud, 0, 6, "Donchian (14) H / L", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 6, str.tostring(donUpper, "#.##") + " / " + str.tostring(donLower, "#.##"), text_color=#ffffff, text_size=size.small)
-
-    table.cell(hud, 0, 7, "Stop (1.5ATR) / Tgt", text_color=#aaaaaa, text_size=size.small)
-    table.cell(hud, 1, 7, str.tostring(hudStop, "#.##") + " / " + str.tostring(hudTgt, "#.##"), text_color=#ffab40, text_size=size.small)
+    string state = entryDeadline >= flatDeadline ? "FIX CUTOFF ORDER" : not supportedTimeframe ? "USE 1-15 MIN CHART" : dailyHalt ? "DAILY HALT" : not entryWindow ? "OUTSIDE ENTRY WINDOW" : not volumeValid ? "INVALID VOLUME" : not baselineReady ? "BASELINE WARMUP" : strategy.position_size != 0 ? "POSITION OPEN" : not cooldownOk ? "COOLDOWN" : maxDailyTrades > 0 and entriesToday >= maxDailyTrades ? "TRADE LIMIT" : enterLong ? "LONG ENTRY" : enterShort ? "SHORT ENTRY" : "WAIT"
+    string levels = strategy.position_size == 0 ? "FLAT" : str.tostring(activeStop, format.mintick) + " / " + (useTakeProfit ? str.tostring(activeTarget, format.mintick) : "TARGET OFF")
+    table.cell(hud, 0, 0, "STATE", text_color=color.white)
+    table.cell(hud, 1, 0, state, text_color=color.white)
+    table.cell(hud, 0, 1, "Volume Source", text_color=color.white)
+    table.cell(hud, 1, 1, usingProxy ? proxyTicker : syminfo.tickerid, text_color=color.white)
+    table.cell(hud, 0, 2, "RVOL / Minimum", text_color=color.white)
+    table.cell(hud, 1, 2, (na(rvol) ? "N/A" : str.tostring(rvol, "#.##")) + " / " + str.tostring(effectiveRvol, "#.##"), text_color=color.white)
+    table.cell(hud, 0, 3, "Effective Z / Minimum", text_color=color.white)
+    table.cell(hud, 1, 3, (na(effectiveZ) ? "N/A" : str.tostring(effectiveZ, "#.##")) + " / " + str.tostring(effectiveMinZ, "#.##"), text_color=color.white)
+    table.cell(hud, 0, 4, "Baseline", text_color=color.white)
+    table.cell(hud, 1, 4, useSameSlot ? "Slot " + str.tostring(sampleCount) + "/" + str.tostring(slotSamples) : "Valid " + str.tostring(rollingCount) + "/" + str.tostring(volWindow) + (rollingReady ? " READY" : " WARMUP / AGE"), text_color=color.white)
+    table.cell(hud, 0, 5, "CLV / Long Minimum", text_color=color.white)
+    table.cell(hud, 1, 5, str.tostring(clv, "#.##") + " / " + str.tostring(effectiveClv, "#.##"), text_color=(clv >= effectiveClv or clv <= 1 - effectiveClv) ? color.lime : color.white)
+    table.cell(hud, 0, 6, "Donchian Length", text_color=color.white)
+    table.cell(hud, 1, 6, str.tostring(effectiveDonLen), text_color=color.white)
+    table.cell(hud, 0, 7, "Active Stop / Target", text_color=color.white)
+    table.cell(hud, 1, 7, levels, text_color=color.orange)
+    table.cell(hud, 0, 8, "Entries Today / Max", text_color=color.white)
+    table.cell(hud, 1, 8, str.tostring(entriesToday) + " / " + (maxDailyTrades == 0 ? "OFF" : str.tostring(maxDailyTrades)), text_color=color.white)
+    string filterText = not useVwapFilter ? "OFF" : not inSession ? "OUTSIDE SESSION" : not volumeValid ? "MISSING VOLUME" : na(sessionVwap) ? (vwapRecovery == "Strict session" ? "SESSION INCOMPLETE" : "RECOVERY WARMUP") : (recoveringAverage ? "RESTARTED: " : "SESSION: ") + (close >= sessionVwap ? "ABOVE" : "BELOW")
+    table.cell(hud, 0, 9, usingProxy ? "Synthetic VWAP" : "Chart VWAP", text_color=color.white)
+    table.cell(hud, 1, 9, filterText, text_color=color.white)
+    string dataText = not volumeValid ? (usingProxy and not na(proxyTime) and proxyTime != time ? "PROXY BAR NOT ALIGNED" : "VOLUME UNAVAILABLE") : not baselineReady ? "BASELINE NOT READY" : "VALID"
+    table.cell(hud, 0, 10, "Data Status", text_color=color.white)
+    table.cell(hud, 1, 10, dataText, text_color=volumeValid and baselineReady ? color.lime : color.orange)
+    table.cell(hud, 0, 11, "Session Clock", text_color=color.white)
+    table.cell(hud, 1, 11, str.format_time(time_close, "HH:mm", sessionZone) + " " + sessionZone, text_color=color.white)

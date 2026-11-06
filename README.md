@@ -4,8 +4,8 @@ A multithreaded quantitative volume-breakout screener and backtesting engine for
 
 Includes both a **dark-themed Python Desktop Terminal (`gui.py`)** for market-wide screening and **TradingView Pine Script v5 Strategies (`pinescript/`)** for chart-level backtesting and alerts on NSE and SPX/US equities.
 
-![NSE Trade Anomaly Detector dashboard](docs/dashboard.png)
-
+![Argus dashboard](docs/dashboard.png)
+![PinescriptSPX](docs/spxpinescriptview.png)
 ---
 
 ## Key Features
